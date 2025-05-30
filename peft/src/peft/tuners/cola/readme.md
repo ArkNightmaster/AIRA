@@ -152,8 +152,3 @@ cola_model = ColaModel(model, config, "default")
 
 这种设计使得CoLA能够在保持模型性能的同时，提供灵活的参数高效微调能力。
 """
-
-if __name__ == "__main__":
-    print("CoLA项目结构说明文档")
-    print("=" * 50)
-    print("请查看本文件的文档字符串获取详细信息") 

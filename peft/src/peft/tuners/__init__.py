@@ -20,6 +20,7 @@
 from .adaption_prompt import AdaptionPromptConfig, AdaptionPromptModel
 from .lora import LoraConfig, LoraModel, LoftQConfig, LoraRuntimeConfig
 from .cola import ColaConfig, ColaModel
+from .aira_moe import AiraMoeConfig, AiraMoeModel
 from .hydralora import HydraLoraConfig, HydraLoraModel
 from .loha import LoHaConfig, LoHaModel
 from .lokr import LoKrConfig, LoKrModel
