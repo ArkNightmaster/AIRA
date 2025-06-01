@@ -242,7 +242,7 @@ if is_bnb_available():
 
         def __repr__(self) -> str:
             rep = super().__repr__()
-            return "aira_moe." + rep
+            return "lora." + rep
 
 
 if is_bnb_4bit_available():
@@ -448,4 +448,4 @@ if is_bnb_4bit_available():
 
         def __repr__(self) -> str:
             rep = super().__repr__()
-            return "aira_moe." + rep 
+            return "lora." + rep 

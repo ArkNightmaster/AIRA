@@ -193,4 +193,4 @@ class QuantLinear(torch.nn.Module, AiraMoeLayer):
 
     def __repr__(self) -> str:
         rep = super().__repr__()
-        return "aira_moe." + rep 
+        return "lora." + rep 

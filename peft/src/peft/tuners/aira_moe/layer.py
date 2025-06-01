@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from transformers.pytorch_utils import Conv1D
 
-from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters
+from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils import transpose
 
 from .config import AiraMoeConfig
@@ -169,15 +169,17 @@ class AiraMoeLayer(BaseTunerLayer):
         else:
             self._init_lora_weights(adapter_name, init_lora_weights)
 
-        # Move to device
+        # Move to device and convert to correct dtype
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        
+        # Additional manual dtype conversion for ModuleList items
         weight = getattr(self.get_base_layer(), "weight", None)
-        if weight is not None:
-            # the layer is already completely initialized, this is an update
-            if weight.dtype.is_floating_point or weight.dtype.is_complex:
-                for i in range(num_A):
-                    self.lora_A[adapter_name][i].to(weight.device, dtype=weight.dtype)
-                for i in range(num_B):
-                    self.lora_B[adapter_name][i].to(weight.device, dtype=weight.dtype)
+        if weight is not None and (weight.dtype.is_floating_point or weight.dtype.is_complex):
+            # Convert each module in the ModuleList to the correct dtype
+            for i in range(num_A):
+                self.lora_A[adapter_name][i] = self.lora_A[adapter_name][i].to(weight.dtype)
+            for i in range(num_B):
+                self.lora_B[adapter_name][i] = self.lora_B[adapter_name][i].to(weight.dtype)
 
         self.set_adapter(self.active_adapters)
 
@@ -226,16 +228,22 @@ class AiraMoeLayer(BaseTunerLayer):
         lora_A = (torch.diag(torch.sqrt(Sr)) @ Uhr) / self.num_A[adapter_name]
         lora_B = (Vr @ torch.diag(torch.sqrt(Sr))) / self.num_B[adapter_name]
         
+        # Convert back to original dtype for LoRA parameters
+        original_dtype = self.lora_A[adapter_name][0].weight.dtype
+        lora_A = lora_A.to(original_dtype)
+        lora_B = lora_B.to(original_dtype)
+        
         # Initialize all matrices
         for i in range(self.num_A[adapter_name]):
             self.lora_A[adapter_name][i].weight.data = lora_A.clone()
         for i in range(self.num_B[adapter_name]):
             self.lora_B[adapter_name][i].weight.data = lora_B.clone()
         
-        # Update base weight
-        weight.data -= self.scaling[adapter_name] * (
-            (lora_B * self.num_B[adapter_name]) @ (lora_A * self.num_A[adapter_name])
+        # Update base weight (convert back to original dtype)
+        delta_weight = self.scaling[adapter_name] * (
+            (lora_B.to(torch.float32) * self.num_B[adapter_name]) @ (lora_A.to(torch.float32) * self.num_A[adapter_name])
         )
+        weight.data -= delta_weight
 
     def _awsvd_init(self, adapter_name: str, inputs: torch.Tensor) -> None:
         """
@@ -244,17 +252,19 @@ class AiraMoeLayer(BaseTunerLayer):
         if self.activation_stats_collected[adapter_name]:
             return
             
+        # Convert all tensors to float32 for SVD computation
         weight = self.get_base_layer().weight.to(torch.float32)
+        inputs_f32 = inputs.to(torch.float32)
         
         # Calculate activation-aware scaling matrix S
-        X = inputs.view(-1, weight.size(1))  # Flatten to [batch*seq, in_features]
+        X = inputs_f32.view(-1, weight.size(1))  # Flatten to [batch*seq, in_features]
         S_diag = torch.sqrt(torch.mean(X**2, dim=0))  # RMS of each input feature
         S = torch.diag(S_diag)
         
         # Calculate scaled weight matrix W'
-        W_prime = weight @ S
+        W_prime = (weight @ S).to(torch.float32)
         
-        # SVD decomposition of W'
+        # SVD decomposition of W' (ensure float32 for SVD)
         U, S_vals, Vh = torch.linalg.svd(W_prime, full_matrices=False)
         U = U[:, :self.r[adapter_name]]
         S_vals = S_vals[:self.r[adapter_name]]
@@ -270,6 +280,11 @@ class AiraMoeLayer(BaseTunerLayer):
         # Distribute among multiple A and B matrices
         lora_A = (Vh @ S_inv) / self.num_A[adapter_name]
         lora_B = (U @ torch.diag(S_vals)) / self.num_B[adapter_name]
+        
+        # Convert back to original dtype for LoRA parameters
+        original_dtype = self.lora_A[adapter_name][0].weight.dtype
+        lora_A = lora_A.to(original_dtype)
+        lora_B = lora_B.to(original_dtype)
         
         # Initialize all matrices
         for i in range(self.num_A[adapter_name]):
@@ -340,7 +355,7 @@ class AiraMoeLayer(BaseTunerLayer):
         self.scaling[adapter_name] /= scaling
 
 
-class Linear(nn.Linear, AiraMoeLayer):
+class Linear(nn.Module, AiraMoeLayer):
     """
     AiraMoe Linear layer that combines CoLA's collaborative adaptation with AwLoRA's three core technologies.
     """
@@ -400,7 +415,7 @@ class Linear(nn.Linear, AiraMoeLayer):
                 The list of adapter names that should be merged. If None, all active adapters will be merged.
                 Defaults to `None`.
         """
-        adapter_names = check_adapters(self, adapter_names)
+        adapter_names = check_adapters_to_merge(self, adapter_names)
 
         if self.merged_adapters:
             warnings.warn(
@@ -472,7 +487,6 @@ class Linear(nn.Linear, AiraMoeLayer):
         return output_tensor
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
 
         if self.disable_adapters:
@@ -540,7 +554,7 @@ class Linear(nn.Linear, AiraMoeLayer):
 
     def __repr__(self) -> str:
         rep = super().__repr__()
-        return "aira_moe." + rep
+        return "lora." + rep
 
 
 class Embedding(nn.Embedding, AiraMoeLayer):
@@ -615,7 +629,7 @@ class Embedding(nn.Embedding, AiraMoeLayer):
         # Initialize weights
         self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        # Move to device
+        # Move to device and convert to correct dtype
         weight = getattr(self.get_base_layer(), "weight", None)
         if weight is not None:
             # the layer is already completely initialized, this is an update
@@ -667,7 +681,7 @@ class Embedding(nn.Embedding, AiraMoeLayer):
 
     def __repr__(self) -> str:
         rep = super().__repr__()
-        return "aira_moe." + rep
+        return "lora." + rep
 
 
 class Conv2d(nn.Conv2d, AiraMoeLayer):
@@ -746,15 +760,17 @@ class Conv2d(nn.Conv2d, AiraMoeLayer):
         # Initialize weights
         self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-        # Move to device
+        # Move to device and convert to correct dtype
+        self._move_adapter_to_device_of_base_layer(adapter_name)
+        
+        # Additional manual dtype conversion for ModuleList items
         weight = getattr(self.get_base_layer(), "weight", None)
-        if weight is not None:
-            # the layer is already completely initialized, this is an update
-            if weight.dtype.is_floating_point or weight.dtype.is_complex:
-                for i in range(num_A):
-                    self.lora_A[adapter_name][i].to(weight.device, dtype=weight.dtype)
-                for i in range(num_B):
-                    self.lora_B[adapter_name][i].to(weight.device, dtype=weight.dtype)
+        if weight is not None and (weight.dtype.is_floating_point or weight.dtype.is_complex):
+            # Convert each module in the ModuleList to the correct dtype
+            for i in range(num_A):
+                self.lora_A[adapter_name][i] = self.lora_A[adapter_name][i].to(weight.dtype)
+            for i in range(num_B):
+                self.lora_B[adapter_name][i] = self.lora_B[adapter_name][i].to(weight.dtype)
 
         self.set_adapter(self.active_adapters)
 
@@ -782,4 +798,4 @@ class Conv2d(nn.Conv2d, AiraMoeLayer):
 
     def __repr__(self) -> str:
         rep = super().__repr__()
-        return "aira_moe." + rep 
+        return "lora." + rep 

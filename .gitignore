@@ -3,6 +3,7 @@ cola/*
 .cursor/*
 *.pyc
 LLaMA-Factory/saves/*
+*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

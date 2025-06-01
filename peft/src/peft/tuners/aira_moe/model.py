@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from dataclasses import asdict, replace
 from enum import Enum
 from typing import Optional, Union
+import hashlib
 
 import torch
 import torch.nn as nn
@@ -94,7 +96,7 @@ class AiraMoeModel(BaseTuner):
         - **peft_config** ([`AiraMoeConfig`]): The configuration of the AiraMoe model.
     """
 
-    prefix: str = "aira_moe_"
+    prefix: str = "lora_"
     layers_mapping = {
         nn.Linear: Linear,
         nn.Embedding: Embedding,
@@ -377,6 +379,49 @@ class AiraMoeModel(BaseTuner):
 
         self.active_adapter = new_adapter or []
 
+    def set_adapter(self, adapter_name: str | list[str]) -> None:
+        """Set the active adapter(s).
+
+        Additionally, this function will set the specified adapters to trainable (i.e., requires_grad=True). If this is
+        not desired, use the following code.
+
+        ```py
+        >>> for name, param in model_peft.named_parameters():
+        ...     if ...:  # some check on name (ex. if 'lora' in name)
+        ...         param.requires_grad = False
+        ```
+
+        Args:
+            adapter_name (`str` or `list[str]`): Name of the adapter(s) to be activated.
+        """
+        for module in self.model.modules():
+            if isinstance(module, AiraMoeLayer):
+                if module.merged_adapters:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+
+                # Set requires_grad for lora_A layers
+                module_dict = getattr(module, "lora_A", {})
+                for key, layer in module_dict.items():
+                    if key in self.active_adapters:
+                        for expert_layer in layer:
+                            expert_layer.requires_grad_(True)
+                    else:
+                        for expert_layer in layer:
+                            expert_layer.requires_grad_(False)
+                       
+                # Set requires_grad for lora_B layers
+                module_dict = getattr(module, "lora_B", {})
+                for key, layer in module_dict.items():
+                    if key in self.active_adapters:
+                        for expert_layer in layer:
+                            expert_layer.requires_grad_(True)
+                    else:
+                        for expert_layer in layer:
+                            expert_layer.requires_grad_(False)
+
+        self.active_adapter = adapter_name
+
     def merge_and_unload(
         self, progressbar: bool = False, safe_merge: bool = False, adapter_names: Optional[list[str]] = None
     ) -> torch.nn.Module:
@@ -444,6 +489,36 @@ class AiraMoeModel(BaseTuner):
         Returns:
             dict: Layer importance metrics
         """
+        # Create output directory if it doesn't exist
+        output_dir = "./output/aira_moe/layer_importance"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Generate a unique hash for the current configuration
+        config_hash = self._generate_config_hash(max_samples)
+        cache_file = os.path.join(output_dir, f"layer_importance_{config_hash}.pt")
+        
+        # Check if cached file exists
+        if os.path.exists(cache_file):
+            print(f"Loading cached layer importance from {cache_file}")
+            try:
+                cached_importance = torch.load(cache_file, map_location='cpu')
+                print(f"Successfully loaded layer importance for {len(cached_importance)} layers")
+                return cached_importance
+            except Exception as e:
+                print(f"Failed to load cached file: {e}. Computing layer importance...")
+        
+        print(f"Computing layer importance (will be cached to {cache_file})")
+        
+        # Automatically detect device if not specified or if model is not on the specified device
+        try:
+            model_device = next(self.model.parameters()).device
+            if device != model_device:
+                device = model_device
+                print(f"Using model device: {device}")
+        except StopIteration:
+            # Fallback if model has no parameters
+            device = torch.device(device)
+            
         self.model.eval()
         layer_importance = {}
         
@@ -468,25 +543,48 @@ class AiraMoeModel(BaseTuner):
                     input_tensor = input[0].detach()
                     weight_tensor = module.weight.detach()
                     
-                    # Compute input norms
-                    input_norm = torch.linalg.vector_norm(input_tensor, ord=2, dim=0)
+                    # Reshape input tensor to [batch*seq, features] for norm computation
+                    if input_tensor.dim() > 2:
+                        input_reshaped = input_tensor.view(-1, input_tensor.size(-1))
+                    else:
+                        input_reshaped = input_tensor
+                    
+                    # Compute input norms across the feature dimension
+                    input_norm = torch.linalg.vector_norm(input_reshaped, ord=2, dim=0)
                     layer_importance[name]['input_norms'].append(input_norm.cpu())
                     
-                    # Compute weight-activation interaction matrix A_ij
-                    A_ij = torch.abs(weight_tensor) * input_norm.unsqueeze(0)
-                    mean_A_l = A_ij.mean().item()
-                    
-                    # LOD outlier detection with threshold M
-                    M = self.peft_config[self.active_adapter].lod_threshold_M
-                    lod_value = (A_ij > M * mean_A_l).float().mean().item()
-                    layer_importance[name]['lod_values'].append(lod_value)
+                    # Ensure input_norm matches weight tensor's input dimension
+                    if input_norm.size(0) == weight_tensor.size(1):
+                        # Compute weight-activation interaction matrix A_ij
+                        A_ij = torch.abs(weight_tensor) * input_norm.unsqueeze(0)
+                        mean_A_l = A_ij.mean().item()
+                        
+                        # LOD outlier detection with threshold M
+                        active_adapter = self.active_adapter
+                        if isinstance(active_adapter, list):
+                            active_adapter = active_adapter[0] if active_adapter else "default"
+                        M = self.peft_config[active_adapter].lod_threshold_M
+                        lod_value = (A_ij > M * mean_A_l).float().mean().item()
+                        layer_importance[name]['lod_values'].append(lod_value)
+                    else:
+                        # Skip LOD computation if dimensions don't match
+                        layer_importance[name]['lod_values'].append(0.0)
                     
             return hook
         
         # Register hooks for target modules
         hooks = []
         for name, module in self.model.named_modules():
-            if any(target in name for target in self.peft_config[self.active_adapter].target_modules):
+            # Get the active adapter name (handle both string and list cases)
+            active_adapter = self.active_adapter
+            if isinstance(active_adapter, list):
+                active_adapter = active_adapter[0] if active_adapter else "default"
+            
+            target_modules = self.peft_config[active_adapter].target_modules
+            if isinstance(target_modules, str):
+                target_modules = [target_modules]
+            
+            if any(target in name for target in target_modules):
                 hook = module.register_forward_hook(hook_fn(name))
                 hooks.append(hook)
         
@@ -497,18 +595,45 @@ class AiraMoeModel(BaseTuner):
                 if sample_count >= max_samples:
                     break
                     
-                # Move batch to device
+                # Handle different batch formats
                 if isinstance(batch, dict):
-                    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                    self.model(**batch)
+                    # WikiText-2 format: {"input_ids": tensor, "attention_mask": tensor}
+                    if "input_ids" in batch:
+                        input_ids = batch["input_ids"]
+                        attention_mask = batch.get("attention_mask", None)
+                        
+                        # Move to device if needed
+                        if hasattr(input_ids, 'to'):
+                            input_ids = input_ids.to(device)
+                        if attention_mask is not None and hasattr(attention_mask, 'to'):
+                            attention_mask = attention_mask.to(device)
+                        
+                        # Forward pass with mixed precision autocast
+                        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                            if attention_mask is not None:
+                                self.model(input_ids=input_ids, attention_mask=attention_mask)
+                            else:
+                                self.model(input_ids)
+                        
+                        sample_count += input_ids.size(0)
+                    else:
+                        # Generic dict format
+                        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                            self.model(**batch)
+                        sample_count += len(batch)
                 elif isinstance(batch, (list, tuple)):
+                    # List/tuple format
                     batch = [x.to(device) if isinstance(x, torch.Tensor) else x for x in batch]
-                    self.model(*batch)
+                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                        self.model(*batch)
+                    sample_count += len(batch)
                 else:
+                    # Single tensor format
                     batch = batch.to(device)
-                    self.model(batch)
-                
-                sample_count += batch.size(0) if hasattr(batch, 'size') else len(batch)
+                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                        self.model(batch)
+                    sample_count += batch.size(0) if hasattr(batch, 'size') else 1
         
         # Remove hooks
         for hook in hooks:
@@ -522,7 +647,45 @@ class AiraMoeModel(BaseTuner):
                 'lod_mean': sum(stats['lod_values']) / len(stats['lod_values']) if stats['lod_values'] else 0,
             }
         
+        # Save the computed layer importance to cache
+        try:
+            torch.save(aggregated_importance, cache_file)
+            print(f"Layer importance cached to {cache_file}")
+        except Exception as e:
+            print(f"Failed to save layer importance cache: {e}")
+        
         return aggregated_importance
+
+    def _generate_config_hash(self, max_samples):
+        """
+        Generate a unique hash for the current model configuration and parameters.
+        
+        Args:
+            max_samples: Maximum number of samples used for computation
+            
+        Returns:
+            str: Unique hash string for the configuration
+        """
+        # Get the active adapter name (handle both string and list cases)
+        active_adapter = self.active_adapter
+        if isinstance(active_adapter, list):
+            active_adapter = active_adapter[0] if active_adapter else "default"
+        
+        config = self.peft_config[active_adapter]
+        
+        # Create a string representation of the configuration
+        config_str = f"model_name:{getattr(self.model.config, 'name_or_path', 'unknown')}"
+        config_str += f"_target_modules:{sorted(config.target_modules) if isinstance(config.target_modules, list) else config.target_modules}"
+        config_str += f"_lod_threshold_M:{config.lod_threshold_M}"
+        config_str += f"_theta_type:{config.theta_type}"
+        config_str += f"_max_samples:{max_samples}"
+        config_str += f"_r:{config.r}"
+        config_str += f"_num_A:{config.num_A}"
+        config_str += f"_num_B:{config.num_B}"
+        
+        # Generate MD5 hash
+        hash_object = hashlib.md5(config_str.encode())
+        return hash_object.hexdigest()[:16]  # Use first 16 characters
 
     def optimize_layer_ranks(self, layer_importance, objective_function="log"):
         """
@@ -538,7 +701,12 @@ class AiraMoeModel(BaseTuner):
         from scipy.optimize import minimize
         import numpy as np
         
-        config = self.peft_config[self.active_adapter]
+        # Get the active adapter name (handle both string and list cases)
+        active_adapter = self.active_adapter
+        if isinstance(active_adapter, list):
+            active_adapter = active_adapter[0] if active_adapter else "default"
+        
+        config = self.peft_config[active_adapter]
         theta_type = config.theta_type
         rank_budget = config.rank_budget
         min_rank = config.min_rank
@@ -639,38 +807,71 @@ class AiraMoeModel(BaseTuner):
         Args:
             rank_allocation: Dictionary mapping layer names to ranks
         """
+        # Get the active adapter name (handle both string and list cases)
+        active_adapter = self.active_adapter
+        if isinstance(active_adapter, list):
+            active_adapter = active_adapter[0] if active_adapter else "default"
+            
         for name, module in self.model.named_modules():
             if isinstance(module, AiraMoeLayer) and name in rank_allocation:
                 new_rank = rank_allocation[name]
-                adapter_name = self.active_adapter
                 
                 # Update the rank for this layer
-                if adapter_name in module.r:
-                    old_rank = module.r[adapter_name]
+                if active_adapter in module.r:
+                    old_rank = module.r[active_adapter]
                     if old_rank != new_rank:
                         print(f"Updating rank for layer {name}: {old_rank} -> {new_rank}")
                         
                         # Recreate LoRA matrices with new rank
-                        module.r[adapter_name] = new_rank
-                        module.scaling[adapter_name] = module.lora_alpha[adapter_name] / new_rank
+                        module.r[active_adapter] = new_rank
+                        module.scaling[active_adapter] = module.lora_alpha[active_adapter] / new_rank
                         
                         # Recreate A and B matrices
-                        num_A = module.num_A[adapter_name]
-                        num_B = module.num_B[adapter_name]
+                        num_A = module.num_A[active_adapter]
+                        num_B = module.num_B[active_adapter]
                         
-                        module.lora_A[adapter_name] = nn.ModuleList([
+                        module.lora_A[active_adapter] = nn.ModuleList([
                             nn.Linear(module.in_features, new_rank, bias=False) for _ in range(num_A)
                         ])
-                        module.lora_B[adapter_name] = nn.ModuleList([
+                        module.lora_B[active_adapter] = nn.ModuleList([
                             nn.Linear(new_rank, module.out_features, bias=False) for _ in range(num_B)
                         ])
                         
                         # Reinitialize weights
-                        module.reset_lora_parameters(adapter_name, True)
+                        module.reset_lora_parameters(active_adapter, True)
                         
                         # Move to correct device
                         device = next(module.get_base_layer().parameters()).device
                         for i in range(num_A):
-                            module.lora_A[adapter_name][i].to(device)
+                            module.lora_A[active_adapter][i].to(device)
                         for i in range(num_B):
-                            module.lora_B[adapter_name][i].to(device) 
+                            module.lora_B[active_adapter][i].to(device)
+
+    def _set_adapter_layers(self, enabled: bool = True) -> None:
+        for module in self.model.modules():
+            if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
+                module.enable_adapters(enabled)
+
+    def enable_adapter_layers(self) -> None:
+        """Enable all adapters.
+
+        Call this if you have previously disabled all adapters and want to re-enable them.
+        """
+        self._set_adapter_layers(enabled=True)
+
+    def disable_adapter_layers(self) -> None:
+        """Disable all adapters.
+
+        When disabling all adapters, the model output corresponds to the output of the base model.
+        """
+        for active_adapter in self.active_adapters:
+            val = self.peft_config[active_adapter].bias
+            if val != "none":
+                msg = (
+                    f"Careful, disabling adapter layers with bias configured to be '{val}' does not produce the same "
+                    "output as the the base model would without adaption."
+                )
+                warnings.warn(msg)
+        self._set_adapter_layers(enabled=False)
+
+

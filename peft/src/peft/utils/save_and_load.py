@@ -73,7 +73,7 @@ def get_peft_model_state_dict(
         state_dict = model.state_dict()
 
     # TUNER SPECIFIC CODE
-    if config.peft_type in (PeftType.LORA, PeftType.ADALORA, PeftType.COLA, PeftType.HYDRALORA):
+    if config.peft_type in (PeftType.LORA, PeftType.ADALORA, PeftType.COLA, PeftType.HYDRALORA, PeftType.AIRA_MOE):
         # to_return = lora_state_dict(model, bias=model.peft_config.bias)
         # adapted from `https://github.com/microsoft/LoRA/blob/main/loralib/utils.py`
         # to be used directly with the state dict which is necessary when using DeepSpeed or FSDP
@@ -101,7 +101,7 @@ def get_peft_model_state_dict(
                 config.rank_pattern = rank_pattern
                 to_return = model.resize_state_dict_by_rank_pattern(rank_pattern, to_return, adapter_name)
 
-        if config.peft_type != PeftType.COLA and config.peft_type != PeftType.HYDRALORA and config.use_dora:
+        if config.peft_type != PeftType.COLA and config.peft_type != PeftType.HYDRALORA and config.peft_type != PeftType.AIRA_MOE and config.use_dora:
             # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
             # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer. Since
             # we want the state_dict format not to change, we remove the "weight" part.
@@ -314,6 +314,7 @@ def set_peft_model_state_dict(
     if config.peft_type in (
         PeftType.LORA,
         PeftType.COLA,
+        PeftType.AIRA_MOE,
         PeftType.HYDRALORA,
         PeftType.LOHA,
         PeftType.LOKR,
@@ -332,6 +333,7 @@ def set_peft_model_state_dict(
             PeftType.IA3: "ia3_",
             PeftType.LORA: "lora_",
             PeftType.COLA: "lora_",
+            PeftType.AIRA_MOE: "lora_",
             PeftType.HYDRALORA: "lora_",
             PeftType.ADALORA: "lora_",
             PeftType.LOHA: "hada_",
@@ -389,6 +391,17 @@ def set_peft_model_state_dict(
 
             peft_model_state_dict = {renamed_dora_weights(k): v for k, v in peft_model_state_dict.items()}
         elif config.peft_type == PeftType.COLA:
+            # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
+            # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer.
+            old_dora_suffix = f"lora_magnitude_vector.{adapter_name}"
+
+            def renamed_dora_weights(k):
+                if k.endswith(old_dora_suffix):
+                    k = k + ".weight"
+                return k
+
+            peft_model_state_dict = {renamed_dora_weights(k): v for k, v in peft_model_state_dict.items()}
+        elif config.peft_type == PeftType.AIRA_MOE:
             # Here we take care of a refactor of DoRA which changed lora_magnitude_vector from a ParameterDict to a
             # ModuleDict with a DoraLayer instance. The old parameter is now the "weight" attribute of that layer.
             old_dora_suffix = f"lora_magnitude_vector.{adapter_name}"

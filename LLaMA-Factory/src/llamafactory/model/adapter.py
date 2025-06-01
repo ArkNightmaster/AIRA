@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from peft import LoraConfig, LoraModel, PeftModel, TaskType, ColaConfig, ColaModel, get_peft_model, PeftType, HydraLoraConfig, HydraLoraModel, PromptTuningConfig, PromptTuningInit, PromptEmbedding, IA3Config, IA3Model, PromptEncoder, PromptEncoderConfig
+from peft import LoraConfig, LoraModel, PeftModel, TaskType, ColaConfig, ColaModel, get_peft_model, PeftType, HydraLoraConfig, HydraLoraModel, PromptTuningConfig, PromptTuningInit, PromptEmbedding, IA3Config, IA3Model, PromptEncoder, PromptEncoderConfig, AiraMoeConfig, AiraMoeModel
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import is_fsdp_enabled
 
@@ -388,6 +388,8 @@ def _setup_cola_tuning(
 
 
 
+
+
 def _setup_prompt_tuning(
     config: "PretrainedConfig",
     model: "PreTrainedModel",
@@ -728,6 +730,145 @@ def _setup_hydralora_tuning(
     return model
 
 
+def _setup_aira_moe_tuning(
+    config: "PretrainedConfig",
+    model: "PreTrainedModel",
+    model_args: "ModelArguments",
+    finetuning_args: "FinetuningArguments",
+    is_trainable: bool,
+    cast_trainable_params_to_fp32: bool,
+) -> "PeftModel":
+    if is_trainable:
+        logger.info_rank0("Fine-tuning method: AIRA_MoE")
+
+    adapter_to_resume = None
+
+    if model_args.adapter_name_or_path is not None:
+        is_mergeable = True
+        if getattr(model, "quantization_method", None):  # merge lora in quantized model is unstable
+            assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
+            is_mergeable = False
+
+        if is_deepspeed_zero3_enabled():
+            assert len(model_args.adapter_name_or_path) == 1, "Cannot use multiple adapters in DeepSpeed ZeRO-3."
+            is_mergeable = False
+
+        if model_args.use_unsloth:
+            assert len(model_args.adapter_name_or_path) == 1, "Unsloth model only accepts a single adapter."
+            is_mergeable = False
+
+        if (is_trainable and not finetuning_args.create_new_adapter) or (not is_mergeable):
+            adapter_to_merge = model_args.adapter_name_or_path[:-1]
+            adapter_to_resume = model_args.adapter_name_or_path[-1]
+        else:
+            adapter_to_merge = model_args.adapter_name_or_path
+
+        init_kwargs = {
+            "subfolder": model_args.adapter_folder,
+            "offload_folder": model_args.offload_folder,
+            "cache_dir": model_args.cache_dir,
+            "revision": model_args.model_revision,
+            "token": model_args.hf_hub_token,
+        }
+
+        for adapter in adapter_to_merge:
+            model: "AiraMoeModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
+            # model = model.merge_and_unload()
+
+        if len(adapter_to_merge) > 0:
+            logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
+
+        if adapter_to_resume is not None:  # resume aira_moe training
+            if model_args.use_unsloth:
+                model = load_unsloth_peft_model(config, model_args, is_trainable=is_trainable)
+            else:
+                model = PeftModel.from_pretrained(model, adapter_to_resume, is_trainable=is_trainable, **init_kwargs)
+
+        logger.info_rank0("Loaded adapter(s): {}".format(",".join(model_args.adapter_name_or_path)))
+
+    if is_trainable and adapter_to_resume is None:  # create new aira_moe weights while training
+        if len(finetuning_args.lora_target) == 1 and finetuning_args.lora_target[0] == "all":
+            target_modules = find_all_linear_modules(model, finetuning_args.freeze_vision_tower)
+        else:
+            target_modules = finetuning_args.lora_target
+
+        if finetuning_args.use_llama_pro:
+            target_modules = find_expanded_modules(model, target_modules, finetuning_args.freeze_trainable_layers)
+
+        target_modules = patch_target_modules(model.config, finetuning_args, target_modules)
+
+        if (
+            finetuning_args.use_dora
+            and getattr(model, "quantization_method", None) is not None
+            and getattr(model, "quantization_method", None) != QuantizationMethod.BITS_AND_BYTES
+        ):
+            raise ValueError("DoRA is not compatible with PTQ-quantized models.")
+
+        if model_args.resize_vocab and finetuning_args.additional_target is None:
+            input_embeddings = model.get_input_embeddings()
+            output_embeddings = model.get_output_embeddings()
+            module_names = set()
+            for name, module in model.named_modules():
+                if module in [input_embeddings, output_embeddings]:
+                    module_names.add(name.split(".")[-1])
+
+            finetuning_args.additional_target = module_names
+            logger.warning_rank0("Vocab has been resized, add {} to trainable params.".format(",".join(module_names)))
+
+        peft_kwargs = {
+            "r": finetuning_args.lora_rank,
+            "target_modules": target_modules,
+            "lora_alpha": finetuning_args.lora_alpha,
+            "lora_dropout": finetuning_args.lora_dropout,
+            "num_A": finetuning_args.num_A,
+            "num_B": finetuning_args.num_B,
+            # AwLoRA Core Technology 1: Layer-wise Rank Allocation
+            "use_layer_wise_rank": finetuning_args.use_layer_wise_rank,
+            "lod_threshold_M": finetuning_args.lod_threshold_M,
+            "theta_type": finetuning_args.theta_type,
+            "rank_budget": finetuning_args.rank_budget,
+            "min_rank": finetuning_args.min_rank,
+            "max_rank": finetuning_args.max_rank,
+            "objective_function": finetuning_args.objective_function,
+            # AwLoRA Core Technology 2: AwSVD Initialization
+            "use_awsvd_init": finetuning_args.use_awsvd_init,
+            "awsvd_collect_steps": finetuning_args.awsvd_collect_steps,
+            # AwLoRA Core Technology 3: Activation-aware Weighting
+            "use_activation_aware": finetuning_args.use_activation_aware,
+            "activation_aware_mode": finetuning_args.activation_aware_mode,
+            "activation_normalize": finetuning_args.activation_normalize,
+            "modules_to_save": finetuning_args.additional_target,
+        }
+
+        if model_args.use_unsloth:
+            model = get_unsloth_peft_model(model, model_args, peft_kwargs)
+        else:
+            if finetuning_args.pissa_init:
+                if finetuning_args.pissa_iter == -1:
+                    logger.info_rank0("Using PiSSA initialization.")
+                    peft_kwargs["init_lora_weights"] = "pissa"
+                else:
+                    logger.info_rank0(f"Using PiSSA initialization with FSVD steps {finetuning_args.pissa_iter}.")
+                    peft_kwargs["init_lora_weights"] = f"pissa_niter_{finetuning_args.pissa_iter}"
+            elif finetuning_args.use_awsvd_init:
+                logger.info_rank0("Using AwSVD initialization.")
+                peft_kwargs["init_lora_weights"] = "awsvd"
+
+            aira_moe_config = AiraMoeConfig(
+                task_type=TaskType.CAUSAL_LM,
+                peft_type=PeftType.AIRA_MOE,
+                inference_mode=False,
+                **peft_kwargs,
+            )
+
+            model = get_peft_model(model, aira_moe_config)
+
+    if is_trainable and cast_trainable_params_to_fp32:
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.float32)
+
+    return model
+
 
 def init_adapter(
     config: "PretrainedConfig",
@@ -744,8 +885,8 @@ def init_adapter(
     Note that the trainable parameters must be cast to float32.
     """
     if is_trainable and getattr(model, "quantization_method", None) is not None:
-        if finetuning_args.finetuning_type != "lora":
-            raise ValueError("Quantized models can only be used for the LoRA tuning.")
+        if finetuning_args.finetuning_type not in ["lora", "cola", "aira_moe"]:
+            raise ValueError("Quantized models can only be used for the LoRA, CoLA, or AIRA_MoE tuning.")
 
         if finetuning_args.pissa_init:
             raise ValueError("Cannot initialize PiSSA adapter on quantized models.")
@@ -790,6 +931,10 @@ def init_adapter(
         )
     elif finetuning_args.finetuning_type == "p_tuning":
         model = _setup_p_tuning(
+            config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
+        )
+    elif finetuning_args.finetuning_type == "aira_moe":
+        model = _setup_aira_moe_tuning(
             config, model, model_args, finetuning_args, is_trainable, cast_trainable_params_to_fp32
         )
     else:

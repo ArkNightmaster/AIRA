@@ -487,7 +487,6 @@ class ColaModel(BaseTuner):
 
         return self.model
 
-
     def _check_add_weighted_adapter(
         self, adapters: list[str], combination_type: str, svd_rank: int | None
     ) -> tuple[str, int, str]:

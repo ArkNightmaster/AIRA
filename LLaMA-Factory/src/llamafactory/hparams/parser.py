@@ -83,7 +83,7 @@ def _verify_model_args(
     data_args: "DataArguments",
     finetuning_args: "FinetuningArguments",
 ) -> None:
-    if model_args.adapter_name_or_path is not None and finetuning_args.finetuning_type not in ["lora", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning"]:
+    if model_args.adapter_name_or_path is not None and finetuning_args.finetuning_type not in ["lora", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning", "aira_moe"]:
         raise ValueError("Adapter is only valid for the LoRA method.")
 
     if model_args.quantization_bit is not None:

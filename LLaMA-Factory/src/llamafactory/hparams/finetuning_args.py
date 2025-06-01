@@ -348,7 +348,7 @@ class FinetuningArguments(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
-    finetuning_type: Literal["lora", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning"] = field(
+    finetuning_type: Literal["lora", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning", "aira_moe"] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
     )
@@ -388,7 +388,60 @@ class FinetuningArguments(
     num_A: int = field(default=1, metadata={"help": "Matrix A number"})
     num_B: int = field(default=1, metadata={"help": "Matrix B number"})
 
+    # AIRA_MoE specific parameters
+    # AwLoRA Core Technology 1: Layer-wise Rank Allocation
+    use_layer_wise_rank: bool = field(
+        default=False,
+        metadata={"help": "Whether to use layer-wise rank allocation based on LOD metrics (AIRA_MoE)"}
+    )
+    lod_threshold_M: float = field(
+        default=2.0,
+        metadata={"help": "Threshold multiplier M for LOD outlier detection (AIRA_MoE)"}
+    )
+    theta_type: Literal["act", "lod"] = field(
+        default="lod",
+        metadata={"help": "Type of importance metric for rank allocation: 'act' for activation, 'lod' for LOD (AIRA_MoE)"}
+    )
+    rank_budget: int = field(
+        default=64,
+        metadata={"help": "Total rank budget for optimization-based allocation (AIRA_MoE)"}
+    )
+    min_rank: int = field(
+        default=1,
+        metadata={"help": "Minimum rank for each layer (AIRA_MoE)"}
+    )
+    max_rank: int = field(
+        default=16,
+        metadata={"help": "Maximum rank for each layer (AIRA_MoE)"}
+    )
+    objective_function: Literal["log", "linear", "exp2", "cubic"] = field(
+        default="log",
+        metadata={"help": "Objective function for rank optimization (AIRA_MoE)"}
+    )
     
+    # AwLoRA Core Technology 2: AwSVD Initialization
+    use_awsvd_init: bool = field(
+        default=False,
+        metadata={"help": "Whether to use activation-aware SVD initialization (AIRA_MoE)"}
+    )
+    awsvd_collect_steps: int = field(
+        default=100,
+        metadata={"help": "Number of steps to collect activation statistics for AwSVD (AIRA_MoE)"}
+    )
+    
+    # AwLoRA Core Technology 3: Activation-aware Weighting
+    use_activation_aware: bool = field(
+        default=False,
+        metadata={"help": "Whether to use activation-aware weighted forward propagation (AIRA_MoE)"}
+    )
+    activation_aware_mode: Literal["inps", "outps"] = field(
+        default="inps",
+        metadata={"help": "Mode for activation-aware weighting: 'inps' for input-based, 'outps' for output-based (AIRA_MoE)"}
+    )
+    activation_normalize: bool = field(
+        default=True,
+        metadata={"help": "Whether to normalize activation weights to [0,1] (AIRA_MoE)"}
+    )
 
     def __post_init__(self):
         def split_arg(arg):
@@ -405,7 +458,7 @@ class FinetuningArguments(
         self.freeze_vision_tower = self.freeze_vision_tower or self.train_mm_proj_only
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
 
-        assert self.finetuning_type in ["lora", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning"], "Invalid fine-tuning method."
+        assert self.finetuning_type in ["lora", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning", "aira_moe"], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
 
