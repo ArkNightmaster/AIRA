@@ -608,8 +608,7 @@ class AiraMoeModel(BaseTuner):
                         if attention_mask is not None and hasattr(attention_mask, 'to'):
                             attention_mask = attention_mask.to(device)
                         
-                        # Forward pass with mixed precision autocast
-                        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                        with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):
                             if attention_mask is not None:
                                 self.model(input_ids=input_ids, attention_mask=attention_mask)
                             else:
@@ -619,19 +618,19 @@ class AiraMoeModel(BaseTuner):
                     else:
                         # Generic dict format
                         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                        with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):
                             self.model(**batch)
                         sample_count += len(batch)
                 elif isinstance(batch, (list, tuple)):
                     # List/tuple format
                     batch = [x.to(device) if isinstance(x, torch.Tensor) else x for x in batch]
-                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                    with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):
                         self.model(*batch)
                     sample_count += len(batch)
                 else:
                     # Single tensor format
                     batch = batch.to(device)
-                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+                    with torch.amp.autocast('cuda', enabled=True, dtype=torch.float16):
                         self.model(batch)
                     sample_count += batch.size(0) if hasattr(batch, 'size') else 1
         

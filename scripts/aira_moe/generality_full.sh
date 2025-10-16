@@ -46,7 +46,7 @@ CUDA_VISIBLE_DEVICES=0,1 llamafactory-cli train \
     --min_rank 16 \
     --max_rank 64 \
     --lod_threshold_M 4.0 \
-    --use_awsvd_init true \
+    --use_awsvd_init false \
     --awsvd_collect_steps 100 \
     --use_activation_aware true \
     --activation_aware_mode inps \

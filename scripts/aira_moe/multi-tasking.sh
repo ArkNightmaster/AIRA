@@ -9,7 +9,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 llamafactory-cli train \
     --stage sft \
     --do_train \
     --model_name_or_path /data/Llama-3.1-8B-Instruct \
-    --dataset databricks-dolly-15k,fineval-en,gsm8k,iCliniq \
+    --dataset openorca \
     --dataset_dir ./data \
     --template llama3 \
     --finetuning_type aira_moe \

@@ -211,7 +211,10 @@ if is_bnb_available():
                         
                         if self.activation_aware_mode[active_adapter] == "inps":
                             # Apply weights to input
-                            x_weighted = dropout(x) * activation_weights.unsqueeze(0)
+                            # activation_weights has shape [hidden_size], need to broadcast to match x
+                            weight_shape = [1] * (x.dim() - 1) + [activation_weights.size(-1)]
+                            activation_weights_expanded = activation_weights.view(*weight_shape)
+                            x_weighted = dropout(x) * activation_weights_expanded
                             # CoLA collaborative strategy with activation weighting
                             for i in range(self.num_A[active_adapter]):
                                 for j in range(self.num_B[active_adapter]):
@@ -225,7 +228,10 @@ if is_bnb_available():
                             for i in range(self.num_A[active_adapter]):
                                 for j in range(self.num_B[active_adapter]):
                                     lora_output += lora_B[j](lora_A[i](dropout(x)))
-                            lora_result = (lora_output * activation_weights.unsqueeze(0)) * scaling
+                            # activation_weights has shape [out_features], need to broadcast to match lora_output
+                            weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
+                            activation_weights_expanded = activation_weights.view(*weight_shape)
+                            lora_result = (lora_output * activation_weights_expanded) * scaling
                             if requires_conversion:
                                 lora_result = lora_result.to(expected_dtype)
                             result += lora_result
@@ -417,7 +423,10 @@ if is_bnb_4bit_available():
                         
                         if self.activation_aware_mode[active_adapter] == "inps":
                             # Apply weights to input
-                            x_weighted = dropout(x) * activation_weights.unsqueeze(0)
+                            # activation_weights has shape [hidden_size], need to broadcast to match x
+                            weight_shape = [1] * (x.dim() - 1) + [activation_weights.size(-1)]
+                            activation_weights_expanded = activation_weights.view(*weight_shape)
+                            x_weighted = dropout(x) * activation_weights_expanded
                             # CoLA collaborative strategy with activation weighting
                             for i in range(self.num_A[active_adapter]):
                                 for j in range(self.num_B[active_adapter]):
@@ -431,7 +440,10 @@ if is_bnb_4bit_available():
                             for i in range(self.num_A[active_adapter]):
                                 for j in range(self.num_B[active_adapter]):
                                     lora_output += lora_B[j](lora_A[i](dropout(x)))
-                            lora_result = (lora_output * activation_weights.unsqueeze(0)) * scaling
+                            # activation_weights has shape [out_features], need to broadcast to match lora_output
+                            weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
+                            activation_weights_expanded = activation_weights.view(*weight_shape)
+                            lora_result = (lora_output * activation_weights_expanded) * scaling
                             if requires_conversion:
                                 lora_result = lora_result.to(expected_dtype)
                             result += lora_result

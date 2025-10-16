@@ -301,11 +301,29 @@ class AiraMoeLayer(BaseTunerLayer):
         with torch.no_grad():
             if mode == "inps":
                 # Input-based activation weighting
-                s_i = torch.mean(torch.abs(x), dim=0)  # [in_features]
+                # For input x with shape [batch_size, seq_len, hidden_size]
+                # We want to compute weights over the feature dimension (last dim)
+                # Average over batch and sequence dimensions to get [hidden_size]
+                if x.dim() == 3:  # [batch_size, seq_len, hidden_size]
+                    s_i = torch.mean(torch.abs(x), dim=(0, 1))  # [hidden_size]
+                elif x.dim() == 2:  # [batch_size, hidden_size]
+                    s_i = torch.mean(torch.abs(x), dim=0)  # [hidden_size]
+                else:
+                    # For other dimensions, average over all but the last dimension
+                    dims_to_avg = tuple(range(x.dim() - 1))
+                    s_i = torch.mean(torch.abs(x), dim=dims_to_avg)  # [hidden_size]
             elif mode == "outps":
                 # Output-based activation weighting (computed after base layer)
                 base_output = F.linear(x, self.get_base_layer().weight, self.get_base_layer().bias)
-                s_i = torch.mean(torch.abs(base_output), dim=0)  # [out_features]
+                # Same dimension handling as above
+                if base_output.dim() == 3:  # [batch_size, seq_len, out_features]
+                    s_i = torch.mean(torch.abs(base_output), dim=(0, 1))  # [out_features]
+                elif base_output.dim() == 2:  # [batch_size, out_features]
+                    s_i = torch.mean(torch.abs(base_output), dim=0)  # [out_features]
+                else:
+                    # For other dimensions, average over all but the last dimension
+                    dims_to_avg = tuple(range(base_output.dim() - 1))
+                    s_i = torch.mean(torch.abs(base_output), dim=dims_to_avg)  # [out_features]
             else:
                 raise ValueError(f"Unknown activation aware mode: {mode}")
             
@@ -530,7 +548,11 @@ class Linear(nn.Module, AiraMoeLayer):
                     
                     if self.activation_aware_mode[active_adapter] == "inps":
                         # Apply weights to input
-                        x_weighted = dropout(x) * activation_weights.unsqueeze(0)
+                        # activation_weights has shape [hidden_size], need to broadcast to match x
+                        # For x with shape [batch_size, seq_len, hidden_size], we need [1, 1, hidden_size]
+                        weight_shape = [1] * (x.dim() - 1) + [activation_weights.size(-1)]
+                        activation_weights_expanded = activation_weights.view(*weight_shape)
+                        x_weighted = dropout(x) * activation_weights_expanded
                         # CoLA collaborative strategy with activation weighting
                         for i in range(self.num_A[active_adapter]):
                             for j in range(self.num_B[active_adapter]):
@@ -541,7 +563,10 @@ class Linear(nn.Module, AiraMoeLayer):
                         for i in range(self.num_A[active_adapter]):
                             for j in range(self.num_B[active_adapter]):
                                 lora_output += lora_B[j](lora_A[i](dropout(x)))
-                        result += (lora_output * activation_weights.unsqueeze(0)) * scaling
+                        # activation_weights has shape [out_features], need to broadcast to match lora_output
+                        weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
+                        activation_weights_expanded = activation_weights.view(*weight_shape)
+                        result += (lora_output * activation_weights_expanded) * scaling
                 else:
                     # Standard CoLA collaborative strategy without activation weighting
                     for i in range(self.num_A[active_adapter]):

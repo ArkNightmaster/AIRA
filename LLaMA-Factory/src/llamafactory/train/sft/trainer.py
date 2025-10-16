@@ -81,6 +81,121 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         create_custom_scheduler(self.args, num_training_steps, optimizer)
         return super().create_scheduler(num_training_steps, optimizer)
 
+    def _setup_aira_moe_layer_wise_ranks(self) -> None:
+        """
+        Setup AIRA_MoE layer-wise rank allocation if enabled.
+        This method is called before training starts.
+        """
+        if (hasattr(self.model, 'peft_config') and 
+            self.finetuning_args.finetuning_type == "aira_moe" and
+            self.finetuning_args.use_layer_wise_rank):
+            
+            logger.info_rank0("AIRA_MoE layer-wise rank allocation enabled. Computing layer importance...")
+            
+            try:
+                # Get the PEFT model
+                peft_model = self.model
+                
+                # Create a simple data loader for layer importance computation
+                # Use a subset of training data
+                train_dataloader = self.get_train_dataloader()
+                
+                # Create a simple data loader for layer importance computation
+                # Convert training data to the format expected by compute_layer_importance
+                device = str(next(self.model.parameters()).device)
+                
+                # Create a simple dataset from training data
+                simple_data = []
+                sample_count = 0
+                max_samples = min(500, len(train_dataloader.dataset))
+                
+                for batch in train_dataloader:
+                    if sample_count >= max_samples:
+                        break
+                    
+                    # Convert BatchEncoding to dict format
+                    if hasattr(batch, 'data'):
+                        # BatchEncoding object
+                        batch_dict = dict(batch.data)
+                    elif isinstance(batch, dict):
+                        # Already a dict
+                        batch_dict = batch
+                    else:
+                        # Skip if format is not recognized
+                        continue
+                    
+                    # Extract input_ids and attention_mask
+                    if 'input_ids' in batch_dict:
+                        input_ids = batch_dict['input_ids']
+                        attention_mask = batch_dict.get('attention_mask', None)
+                        
+                        # Add each sample individually
+                        for i in range(input_ids.size(0)):
+                            if sample_count >= max_samples:
+                                break
+                            sample_dict = {'input_ids': input_ids[i:i+1]}
+                            if attention_mask is not None:
+                                sample_dict['attention_mask'] = attention_mask[i:i+1]
+                            simple_data.append(sample_dict)
+                            sample_count += 1
+                
+                # Create a simple DataLoader
+                from torch.utils.data import DataLoader, Dataset
+                
+                class SimpleDataset(Dataset):
+                    def __init__(self, data):
+                        self.data = data
+                    
+                    def __len__(self):
+                        return len(self.data)
+                    
+                    def __getitem__(self, idx):
+                        return self.data[idx]
+                
+                simple_dataset = SimpleDataset(simple_data)
+                simple_dataloader = DataLoader(simple_dataset, batch_size=1, shuffle=False)
+                
+                # Compute layer importance using the simple dataloader
+                layer_importance = peft_model.compute_layer_importance(
+                    simple_dataloader, 
+                    device=device,
+                    max_samples=max_samples
+                )
+                
+                logger.info_rank0(f"Layer importance computed for {len(layer_importance)} layers")
+                
+                # Optimize rank allocation
+                rank_allocation = peft_model.optimize_layer_ranks(
+                    layer_importance, 
+                    objective_function=self.finetuning_args.objective_function
+                )
+                
+                logger.info_rank0("Optimized rank allocation:")
+                total_ranks = 0
+                for layer_name, rank in rank_allocation.items():
+                    logger.info_rank0(f"  {layer_name}: rank={rank}")
+                    total_ranks += rank
+                logger.info_rank0(f"Total ranks used: {total_ranks}/{self.finetuning_args.rank_budget}")
+                
+                # Apply optimized ranks
+                peft_model.apply_layer_wise_ranks(rank_allocation)
+                logger.info_rank0("Layer-wise rank allocation applied successfully!")
+                
+            except Exception as e:
+                logger.warning_rank0(f"Failed to apply layer-wise rank allocation: {e}")
+                logger.warning_rank0("Continuing with uniform rank allocation...")
+
+    @override
+    def train(self, **kwargs):
+        """
+        Override train method to add AIRA_MoE layer-wise rank allocation support.
+        """
+        # Setup AIRA_MoE layer-wise rank allocation before training
+        self._setup_aira_moe_layer_wise_ranks()
+        
+        # Call the original train method
+        return super().train(**kwargs)
+
     @override
     def _get_train_sampler(self) -> Optional["torch.utils.data.Sampler"]:
         if self.finetuning_args.disable_shuffling:
