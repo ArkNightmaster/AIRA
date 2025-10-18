@@ -23,17 +23,17 @@ llamafactory-cli train \
     --cutoff_len 1024 \
     --preprocessing_num_workers 16 \
     --per_device_train_batch_size 8 \
-    --per_device_eval_batch_size 1 \
+    --per_device_eval_batch_size 8 \
     --gradient_accumulation_steps 8 \
     --lr_scheduler_type cosine \
     --logging_steps 5 \
     --warmup_steps 20 \
     --save_steps 100 \
-    --eval_steps 50 \
+    --eval_steps 20 \
     --evaluation_strategy steps \
     --load_best_model_at_end \
-    --learning_rate 5e-3 \
-    --num_train_epochs 3.0 \
+    --learning_rate 5e-6 \
+    --num_train_epochs 1.0 \
     --val_size 0.1 \
     --plot_loss \
     --bf16 \
@@ -47,11 +47,11 @@ llamafactory-cli train \
     --lora_dropout 0.05 \
     --lod_threshold_M 4.0 \
     --awsvd_collect_steps 100 \
-    --ddp_find_unused_parameters true \
-    --use_reentrant_gc false \
     --use_layer_wise_rank true \
+    --use_reentrant_gc false \
+    --ddp_find_unused_parameters true \
     # --use_awsvd_init true \
-    # --use_activation_aware false \
+    # --use_activation_aware true \
     # --activation_aware_mode inps \
     # --activation_normalize true 
 

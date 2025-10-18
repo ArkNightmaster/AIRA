@@ -380,8 +380,7 @@ class AiraMoeModel(BaseTuner):
         adapter_names: Optional[list[str]] = None,
     ):
         if merge:
-            if getattr(self.model, "quantization_method", None) == "gptq":
-                raise ValueError("Cannot merge GPTQ weights")
+            self._check_merge_allowed()
 
         key_list = [key for key, _ in self.model.named_modules() if self.prefix not in key]
         desc = "Unloading " + ("and merging " if merge else "") + "model"
@@ -399,6 +398,46 @@ class AiraMoeModel(BaseTuner):
                 setattr(parent, target_name, target.modules_to_save[target.active_adapter])
 
         return self.model
+
+    def _check_merge_allowed(self):
+        """Verify that the configuration supports merging.
+
+        Parity with LoRA: forbid when base model is GPTQ-quantized or when layer replication is enabled.
+        """
+        if getattr(self.model, "quantization_method", None) == "gptq":
+            raise ValueError("Cannot merge AiraMoe layers when the model is gptq quantized")
+        if self.peft_config.get("layer_replication"):
+            raise ValueError("Cannot merge AiraMoe layers when base model layers are replicated")
+
+    def _enable_peft_forward_hooks(self, *args, **kwargs):
+        """Context manager to inject `adapter_names` into AiraMoe layers at inference, mirroring LoRA behavior."""
+        from contextlib import contextmanager as _contextmanager
+
+        @_contextmanager
+        def _ctx():
+            adapter_names = kwargs.pop("adapter_names", None)
+            if adapter_names is None:
+                yield
+                return
+            if self.training:
+                raise ValueError("Cannot pass `adapter_names` when the model is in training mode.")
+
+            def _pre_forward_hook(target, hook_args, hook_kwargs):
+                hook_kwargs["adapter_names"] = adapter_names
+                return hook_args, hook_kwargs
+
+            handles = []
+            for module in self.modules():
+                if isinstance(module, AiraMoeLayer):
+                    handle = module.register_forward_pre_hook(_pre_forward_hook, with_kwargs=True)
+                    handles.append(handle)
+            try:
+                yield
+            finally:
+                for h in handles:
+                    h.remove()
+
+        return _ctx()
 
     def delete_adapter(self, adapter_name: str) -> None:
         """

@@ -324,23 +324,70 @@ class AiraMoeLayer(BaseTunerLayer):
         elif init_lora_weights.lower() == "pissa":
             self._pissa_init(adapter_name)
 
-    def scale_layer(self, adapter_name: str, scaling: float) -> None:
-        """Scale the adapter layer."""
-        if adapter_name not in self.scaling:
-            # Ignore the case where the adapter is not found in the layer. This case is not a problem as long as
-            # the adapter is not present in any layer (in which case the check in the PEFT model will fail)
+    def set_scale(self, adapter: str, scale: float) -> None:
+        """Set absolute scale for a specific adapter following LoRA semantics."""
+        if adapter not in self.scaling:
+            return
+        r = max(1, int(self.r.get(adapter, 1)))
+        lora_alpha = float(self.lora_alpha.get(adapter, 1))
+        self.scaling[adapter] = float(scale) * (lora_alpha / float(r))
+
+    def scale_layer(self, *args, **kwargs) -> None:
+        """Scale adapter(s).
+
+        Compatible with two calling conventions:
+        - scale_layer(scale: float) -> scales all active adapters
+        - scale_layer(adapter_name: str, scale: float) -> scales one adapter
+        """
+        if len(args) == 1 and isinstance(args[0], (int, float)):
+            scale = float(args[0])
+            for active_adapter in self.active_adapters:
+                if active_adapter in self.scaling:
+                    self.scaling[active_adapter] *= scale
             return
 
-        self.scaling[adapter_name] *= scaling
-
-    def unscale_layer(self, adapter_name: str, scaling: float) -> None:
-        """Unscale the adapter layer."""
-        if adapter_name not in self.scaling:
-            # Ignore the case where the adapter is not found in the layer. This case is not a problem as long as
-            # the adapter is not present in any layer (in which case the check in the PEFT model will fail)
+        if len(args) >= 2:
+            adapter_name, scale = args[0], float(args[1])
+            if adapter_name in self.scaling:
+                self.scaling[adapter_name] *= scale
             return
 
-        self.scaling[adapter_name] /= scaling
+        # fallback to keyword usage
+        adapter_name = kwargs.get("adapter_name", None)
+        scale = kwargs.get("scaling", None)
+        if adapter_name is not None and scale is not None and adapter_name in self.scaling:
+            self.scaling[adapter_name] *= float(scale)
+
+    def unscale_layer(self, *args, **kwargs) -> None:
+        """Unscale adapter(s).
+
+        Compatible with two calling conventions:
+        - unscale_layer() -> reset all active adapters' scaling to lora_alpha / r
+        - unscale_layer(scale: float) -> divide all active adapters' scaling by scale
+        - unscale_layer(adapter_name: str, scale: float) -> divide one adapter's scaling by scale
+        """
+        # adapter-specific form
+        if len(args) >= 2 and isinstance(args[0], str):
+            adapter_name, scale = args[0], float(args[1])
+            if adapter_name in self.scaling:
+                self.scaling[adapter_name] /= scale
+            return
+
+        # all-active form
+        if len(args) == 1 and isinstance(args[0], (int, float)):
+            scale = float(args[0])
+            for active_adapter in self.active_adapters:
+                if active_adapter in self.scaling:
+                    self.scaling[active_adapter] /= scale
+            return
+
+        # reset to base
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.scaling:
+                continue
+            r = max(1, int(self.r.get(active_adapter, 1)))
+            lora_alpha = float(self.lora_alpha.get(active_adapter, 1))
+            self.scaling[active_adapter] = lora_alpha / float(r)
 
 
 class Linear(nn.Module, AiraMoeLayer):
@@ -465,33 +512,39 @@ class Linear(nn.Module, AiraMoeLayer):
         lora_B = self.lora_B[adapter]
 
         if isinstance(lora_A, nn.ModuleList):
-            # Sum all A matrices
             weight_A = torch.sum(torch.stack([layer.weight for layer in lora_A]), dim=0)
         else:
-            # Single A matrix
             weight_A = lora_A.weight
 
         if isinstance(lora_B, nn.ModuleList):
-            # Sum all B matrices
             weight_B = torch.sum(torch.stack([layer.weight for layer in lora_B]), dim=0)
         else:
-            # Single B matrix
             weight_B = lora_B.weight
 
-        # Compute delta weight
+        device = weight_B.device
+        dtype = weight_B.dtype
+        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+
+        if cast_to_fp32:
+            weight_A = weight_A.float()
+            weight_B = weight_B.float()
+
         output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
+
+        if cast_to_fp32:
+            output_tensor = output_tensor.to(dtype=dtype)
         return output_tensor
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         adapter_names = kwargs.pop("adapter_names", None)
+        # Safety checks similar to LoRA
+        if adapter_names is not None and self.merged_adapters:
+            raise ValueError("Cannot pass `adapter_names` when there are merged adapters, please call `unmerge` first.")
 
         if self.disable_adapters:
-            if self.merged_adapters and self.training:
-                # Emit a warning if there are merged adapters and we are in training mode
-                warnings.warn(
-                    "Detected merged adapters in training mode. "
-                    "Training with merged adapters is not recommended as it can lead to unexpected behavior."
-                )
+            if self.merged_adapters:
+                # Auto unmerge to mirror LoRA semantics
+                self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
         elif adapter_names is not None:
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
@@ -542,17 +595,55 @@ class Linear(nn.Module, AiraMoeLayer):
                         result = result + (lora_B(out_A) * scaling)
                     else:  # outps mode
                         # Compute sum over A first using dropout(x), then apply each B once; weight outputs afterward
-                        x_drop = dropout(x)
+                        # ensure dtype alignment
+                        x_drop = dropout(x.to(lora_A.weight.dtype))
                         lora_output = lora_B(lora_A(x_drop))
                         weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
                         activation_weights_expanded = activation_weights.view(*weight_shape)
                         result = result + ((lora_output * activation_weights_expanded) * scaling)
                 else:
                     # Standard CoLA: compute sum over A first, then apply each B once
-                    x_drop = dropout(x)
+                    x_drop = dropout(x.to(lora_A.weight.dtype))
                     result = result + (lora_B(lora_A(x_drop)) * scaling)
 
             result = result.to(torch_result_dtype)
+
+        return result
+
+    def _check_forward_args(self, x, *args, **kwargs):
+        adapter_names = kwargs.get("adapter_names", None)
+        if adapter_names is None:
+            return
+        if len(x) != len(adapter_names):
+            raise ValueError(
+                "Length of `adapter_names` should be the same as the number of inputs, "
+                f"but got {len(adapter_names)} and {len(x)} respectively."
+            )
+        if self.merged_adapters:
+            raise ValueError("Cannot pass `adapter_names` when there are merged adapters, please call `unmerge` first.")
+
+    def _mixed_batch_forward(self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any) -> torch.Tensor:
+        self._check_forward_args(x, *args, adapter_names=adapter_names, **kwargs)
+        result = self.base_layer(x, *args, **kwargs)
+        torch_result_dtype = result.dtype
+
+        unique_adapters = list(set(adapter_names))
+        sub_batch_indices_list = []
+        for adapter in unique_adapters:
+            sub_batch_indices_list.append([index for index, item in enumerate(adapter_names) if item == adapter])
+
+        for i, active_adapter in enumerate(unique_adapters):
+            if active_adapter == "__base__":
+                continue
+            if active_adapter not in self.lora_A.keys():
+                continue
+            lora_A = self.lora_A[active_adapter]
+            lora_B = self.lora_B[active_adapter]
+            dropout = self.lora_dropout[active_adapter]
+            scaling = self.scaling[active_adapter]
+            sub_batch = x[sub_batch_indices_list[i]].to(lora_A.weight.dtype)
+            lora_output = lora_B(lora_A(dropout(sub_batch))) * scaling
+            result[sub_batch_indices_list[i]] += lora_output.to(torch_result_dtype)
 
         return result
 
@@ -663,6 +754,8 @@ class Embedding(nn.Embedding, AiraMoeLayer):
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         # TODO: no dtype conversion here, unlike in Linear, is that correct?
         if self.disable_adapters:
+            if self.merged_adapters:
+                self.unmerge()
             return self.base_layer(x, *args, **kwargs)
 
         result = self.base_layer(x, *args, **kwargs)
@@ -682,6 +775,70 @@ class Embedding(nn.Embedding, AiraMoeLayer):
                     result += lora_embedding_B[j](after_A) * scaling
 
         return result
+
+    def get_delta_weight(self, adapter) -> torch.Tensor:
+        if adapter not in self.lora_embedding_A:
+            return torch.zeros_like(self.get_base_layer().weight)
+
+        weight_A_list = self.lora_embedding_A[adapter]
+        weight_B_list = self.lora_embedding_B[adapter]
+
+        # Sum all A and B then compute B @ A (embedding: treat as linear over one-hot basis)
+        if isinstance(weight_A_list, nn.ModuleList):
+            A = torch.sum(torch.stack([layer.weight for layer in weight_A_list]), dim=0)  # [num_embeddings, r]
+        else:
+            A = weight_A_list.weight  # type: ignore[attr-defined]
+
+        if isinstance(weight_B_list, nn.ModuleList):
+            B = torch.sum(torch.stack([layer.weight for layer in weight_B_list]), dim=0)  # [out_features, r]
+        else:
+            B = weight_B_list.weight  # type: ignore[attr-defined]
+
+        device = B.device
+        dtype = A.dtype
+        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        if cast_to_fp32:
+            A = A.float()
+            B = B.float()
+
+        # For embeddings, delta W has shape [num_embeddings, out_features] and transposed in LoRA merge
+        delta = (B @ A.T).T * self.scaling[adapter]
+        if cast_to_fp32:
+            delta = delta.to(dtype=dtype)
+        return delta
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            return
+        base_layer = self.get_base_layer()
+        for active_adapter in adapter_names:
+            if active_adapter not in self.lora_embedding_A:
+                continue
+            delta = self.get_delta_weight(active_adapter)
+            if safe_merge:
+                orig = base_layer.weight.data.clone()
+                orig += delta
+                if not torch.isfinite(orig).all():
+                    raise ValueError(
+                        f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                    )
+                base_layer.weight.data = orig
+            else:
+                base_layer.weight.data += delta
+            self.merged_adapters.append(active_adapter)
+
+    def unmerge(self) -> None:
+        if not self.merged_adapters:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        base_layer = self.get_base_layer()
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            if active_adapter not in self.lora_embedding_A:
+                continue
+            delta = self.get_delta_weight(active_adapter)
+            base_layer.weight.data -= delta
 
     def __repr__(self) -> str:
         rep = super().__repr__()
@@ -778,6 +935,8 @@ class Conv2d(nn.Conv2d, AiraMoeLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         if self.disable_adapters:
+            if self.merged_adapters:
+                self.unmerge()
             return self.base_layer(x, *args, **kwargs)
 
         result = self.base_layer(x, *args, **kwargs)
@@ -794,10 +953,117 @@ class Conv2d(nn.Conv2d, AiraMoeLayer):
             # CoLA collaborative strategy for Conv2d
             for i in range(self.num_A[active_adapter]):
                 for j in range(self.num_B[active_adapter]):
-                    result += lora_B[j](lora_A[i](dropout(x))) * scaling
+                    result += lora_B[j](lora_A[i](dropout(x.to(lora_A[i].weight.dtype)))) * scaling
 
         return result
+
+    def get_delta_weight(self, adapter) -> torch.Tensor:
+        if adapter not in self.lora_A:
+            return torch.zeros_like(self.get_base_layer().weight)
+
+        weight_A_list = self.lora_A[adapter]
+        weight_B_list = self.lora_B[adapter]
+
+        if isinstance(weight_A_list, nn.ModuleList):
+            weight_A = torch.sum(torch.stack([m.weight for m in weight_A_list]), dim=0)
+        else:
+            weight_A = weight_A_list.weight
+
+        if isinstance(weight_B_list, nn.ModuleList):
+            weight_B = torch.sum(torch.stack([m.weight for m in weight_B_list]), dim=0)
+        else:
+            weight_B = weight_B_list.weight
+
+        device = weight_B.device
+        dtype = weight_A.dtype
+        cast_to_fp32 = device.type == "cpu" and dtype == torch.float16
+        if cast_to_fp32:
+            weight_A = weight_A.float()
+            weight_B = weight_B.float()
+
+        # 1x1 conv special case like LoRA
+        if self.get_base_layer().weight.size()[2:4] == (1, 1):
+            delta = (weight_B.squeeze(3).squeeze(2) @ weight_A.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+            delta = delta * self.scaling[adapter]
+        else:
+            delta = F.conv2d(weight_A.permute(1, 0, 2, 3), weight_B).permute(1, 0, 2, 3)
+            delta = delta * self.scaling[adapter]
+
+        if cast_to_fp32:
+            delta = delta.to(dtype=dtype)
+        return delta
+
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            return
+        base_layer = self.get_base_layer()
+        for active_adapter in adapter_names:
+            if active_adapter not in self.lora_A:
+                continue
+            delta = self.get_delta_weight(active_adapter)
+            if safe_merge:
+                orig = base_layer.weight.data.clone()
+                orig += delta
+                if not torch.isfinite(orig).all():
+                    raise ValueError(
+                        f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
+                    )
+                base_layer.weight.data = orig
+            else:
+                base_layer.weight.data += delta
+            self.merged_adapters.append(active_adapter)
+
+    def unmerge(self) -> None:
+        if not self.merged_adapters:
+            warnings.warn("Already unmerged. Nothing to do.")
+            return
+        base_layer = self.get_base_layer()
+        while len(self.merged_adapters) > 0:
+            active_adapter = self.merged_adapters.pop()
+            if active_adapter not in self.lora_A:
+                continue
+            delta = self.get_delta_weight(active_adapter)
+            base_layer.weight.data -= delta
 
     def __repr__(self) -> str:
         rep = super().__repr__()
         return "lora." + rep 
+
+
+def dispatch_default(
+    target: torch.nn.Module,
+    adapter_name: str,
+    lora_config: AiraMoeConfig,
+    **kwargs,
+) -> Optional[torch.nn.Module]:
+    """Dispatcher for AiraMoe default modules, mirroring LoRA behavior."""
+    new_module = None
+
+    if isinstance(target, BaseTunerLayer):
+        target_base_layer = target.get_base_layer()
+    else:
+        target_base_layer = target
+
+    if isinstance(target_base_layer, torch.nn.Embedding):
+        embedding_kwargs = kwargs.copy()
+        embedding_kwargs.pop("fan_in_fan_out", None)
+        new_module = Embedding(target, adapter_name, **embedding_kwargs)
+    elif isinstance(target_base_layer, torch.nn.Conv2d):
+        new_module = Conv2d(target, adapter_name, **kwargs)
+    elif isinstance(target_base_layer, torch.nn.Linear):
+        if kwargs.get("fan_in_fan_out", False):
+            warnings.warn(
+                "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. Setting it to False."
+            )
+            kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+        new_module = Linear(target, adapter_name, **kwargs)
+    elif isinstance(target_base_layer, Conv1D):
+        if not kwargs.get("fan_in_fan_out", False):
+            warnings.warn(
+                "fan_in_fan_out is set to False but the target module is `Conv1D`. Setting it to True."
+            )
+            kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
+        new_module = Linear(target, adapter_name, is_target_conv_1d_layer=True, **kwargs)
+
+    return new_module
