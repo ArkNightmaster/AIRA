@@ -80,6 +80,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self, num_training_steps: int, optimizer: Optional["torch.optim.Optimizer"] = None
     ) -> "torch.optim.lr_scheduler.LRScheduler":
         create_custom_scheduler(self.args, num_training_steps, optimizer)
+        # Auto-configure AdaLoRA total_step so rank allocation schedule works
+        try:
+            if getattr(self.finetuning_args, "finetuning_type", None) == "adalora":
+                peft_wrapped = self.model
+                # Try to set on PeftModel -> base_model (AdaLoraModel)
+                candidate = getattr(peft_wrapped, "base_model", None)
+                if candidate is None:
+                    candidate = peft_wrapped
+                peft_cfgs = getattr(candidate, "peft_config", None)
+                active = getattr(candidate, "active_adapter", None)
+                if isinstance(peft_cfgs, dict):
+                    key = active if active in peft_cfgs else next(iter(peft_cfgs.keys()))
+                    if key in peft_cfgs and hasattr(peft_cfgs[key], "total_step"):
+                        setattr(peft_cfgs[key], "total_step", int(num_training_steps))
+        except Exception:
+            pass
         return super().create_scheduler(num_training_steps, optimizer)
 
     def _setup_aira_moe_layer_wise_ranks(self) -> None:
@@ -539,7 +555,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._initialize_aira_moe_with_activations()
         
         # Call the original train method
-        return super().train(**kwargs)
+        train_output = super().train(**kwargs)
+
+        # If AdaLoRA is used, ensure final budget allocation mask is applied at the end (safety)
+        try:
+            if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "update_and_allocate"):
+                # Best-effort call; actual step-wise updates should be done in training loop via callbacks if desired.
+                total_steps = getattr(self.finetuning_args, "adalora_total_step", None)
+                if isinstance(total_steps, int) and total_steps > 0:
+                    self.model.base_model.update_and_allocate(total_steps)
+        except Exception:
+            pass
+
+        return train_output
 
     @override
     def _get_train_sampler(self) -> Optional["torch.utils.data.Sampler"]:

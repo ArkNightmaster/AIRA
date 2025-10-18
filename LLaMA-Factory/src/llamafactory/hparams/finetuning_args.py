@@ -127,6 +127,82 @@ class LoraArguments:
 
 
 @dataclass
+class AdaLoraArguments:
+    r"""
+    Arguments for AdaLoRA training. These are mapped to AdaLoraConfig.
+    """
+
+    adalora_target_r: int = field(
+        default=8,
+        metadata={"help": "AdaLoRA target average rank (target_r)."},
+    )
+    adalora_init_r: int = field(
+        default=12,
+        metadata={"help": "AdaLoRA initial rank per layer (init_r)."},
+    )
+    adalora_tinit: int = field(
+        default=0,
+        metadata={"help": "AdaLoRA warmup steps for initial phase (tinit)."},
+    )
+    adalora_tfinal: int = field(
+        default=0,
+        metadata={"help": "AdaLoRA steps for final phase (tfinal)."},
+    )
+    adalora_deltaT: int = field(
+        default=1,
+        metadata={"help": "AdaLoRA allocation interval in steps (deltaT)."},
+    )
+    adalora_beta1: float = field(
+        default=0.85,
+        metadata={"help": "AdaLoRA EMA hyperparameter beta1."},
+    )
+    adalora_beta2: float = field(
+        default=0.85,
+        metadata={"help": "AdaLoRA EMA hyperparameter beta2."},
+    )
+    adalora_orth_reg_weight: float = field(
+        default=0.5,
+        metadata={"help": "AdaLoRA orthogonal regularization weight."},
+    )
+    adalora_total_step: Optional[int] = field(
+        default=None,
+        metadata={"help": "AdaLoRA total training steps. If None, trainer will set automatically."},
+    )
+
+
+@dataclass
+class VeraArguments:
+    r"""
+    Arguments for VeRA training. These are mapped to VeraConfig.
+    """
+
+    vera_r: int = field(
+        default=256,
+        metadata={"help": "VeRA rank dimension r (usually larger than LoRA rank)."},
+    )
+    vera_dropout: float = field(
+        default=0.0,
+        metadata={"help": "VeRA dropout probability."},
+    )
+    vera_bias: Literal["none", "all", "vera_only"] = field(
+        default="none",
+        metadata={"help": "VeRA bias training mode: none | all | vera_only."},
+    )
+    vera_projection_prng_key: int = field(
+        default=0,
+        metadata={"help": "VeRA PRNG init key for shared projections."},
+    )
+    vera_save_projection: bool = field(
+        default=True,
+        metadata={"help": "Whether to save vera_A/vera_B projections in checkpoints."},
+    )
+    vera_d_initial: float = field(
+        default=0.1,
+        metadata={"help": "Initial value for vera_lambda_d (recommended <= 0.1)."},
+    )
+
+
+@dataclass
 class RLHFArguments:
     r"""
     Arguments pertaining to the PPO, DPO and KTO training.
@@ -334,7 +410,14 @@ class SwanLabArguments:
 
 @dataclass
 class FinetuningArguments(
-    FreezeArguments, LoraArguments, RLHFArguments, GaloreArguments, BAdamArgument, SwanLabArguments
+    FreezeArguments,
+    LoraArguments,
+    AdaLoraArguments,
+    VeraArguments,
+    RLHFArguments,
+    GaloreArguments,
+    BAdamArgument,
+    SwanLabArguments,
 ):
     r"""
     Arguments pertaining to which techniques we are going to fine-tuning with.
@@ -348,7 +431,7 @@ class FinetuningArguments(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
-    finetuning_type: Literal["lora", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning", "aira_moe"] = field(
+    finetuning_type: Literal["lora", "adalora", "vera", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning", "aira_moe"] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."},
     )
@@ -462,7 +545,19 @@ class FinetuningArguments(
         self.freeze_vision_tower = self.freeze_vision_tower or self.train_mm_proj_only
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]
 
-        assert self.finetuning_type in ["lora", "freeze", "full", "cola", "hydralora", "prompt_tuning", "ia3", "p_tuning", "aira_moe"], "Invalid fine-tuning method."
+        assert self.finetuning_type in [
+            "lora",
+            "adalora",
+            "vera",
+            "freeze",
+            "full",
+            "cola",
+            "hydralora",
+            "prompt_tuning",
+            "ia3",
+            "p_tuning",
+            "aira_moe",
+        ], "Invalid fine-tuning method."
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
 
