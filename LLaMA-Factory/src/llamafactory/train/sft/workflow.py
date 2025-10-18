@@ -38,7 +38,7 @@ logger = get_logger(__name__)
 
 from codecarbon import track_emissions
 
-@track_emissions()
+# @track_emissions()
 def run_sft(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -101,14 +101,14 @@ def run_sft(
     # Training
     if training_args.do_train:
 
-        # # 为CoLA添加DDP静态图支持
-        # if hasattr(trainer.model, 'module') and hasattr(trainer.model.module, '_ddp_params_and_buffers_to_ignore'):
-        #     # 检查是否使用了CoLA
-        #     for name, module in trainer.model.named_modules():
-        #         if 'lora_A' in name or 'lora_B' in name:
-        #             if hasattr(trainer.model, 'module'):
-        #                 trainer.model.module._set_static_graph()
-        #             break
+        # 为AIRA_MoE添加DDP静态图支持
+        if hasattr(trainer.model, 'module') and hasattr(trainer.model.module, '_ddp_params_and_buffers_to_ignore'):
+            # 检查是否使用了AIRA_MoE
+            for name, module in trainer.model.named_modules():
+                if finetuning_args.finetuning_type == 'aira_moe':
+                    print("Setting static graph for AIRA_MoE")
+                    trainer.model._set_static_graph()
+                    break
 
         # training_args.save_safetensors = False
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)

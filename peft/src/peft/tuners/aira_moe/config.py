@@ -38,8 +38,6 @@ class AiraMoeConfig(PeftConfig):
         target_modules (`Optional[Union[List[str], str]]`): The names of the modules to apply the adapter to.
         lora_alpha (`int`): The alpha parameter for LoRA scaling.
         lora_dropout (`float`): The dropout probability for LoRA layers.
-        num_A (`int`): Number of A matrices (from CoLA).
-        num_B (`int`): Number of B matrices (from CoLA).
         
         # AwLoRA Core Technology 1: Layer-wise Rank Allocation
         use_layer_wise_rank (`bool`): Whether to use layer-wise rank allocation based on LOD metrics.
@@ -89,9 +87,7 @@ class AiraMoeConfig(PeftConfig):
     lora_alpha: int = field(default=8, metadata={"help": "LoRA alpha"})
     lora_dropout: float = field(default=0.0, metadata={"help": "LoRA dropout"})
     
-    # CoLA parameters
-    num_A: int = field(default=1, metadata={"help": "Number of A matrices (CoLA)"})
-    num_B: int = field(default=1, metadata={"help": "Number of B matrices (CoLA)"})
+    # CoLA parameters (AIRA simplified to single A/B per layer; these are removed)
     
     # AwLoRA Core Technology 1: Layer-wise Rank Allocation
     use_layer_wise_rank: bool = field(
@@ -99,7 +95,7 @@ class AiraMoeConfig(PeftConfig):
         metadata={"help": "Whether to use layer-wise rank allocation based on LOD metrics"}
     )
     lod_threshold_M: float = field(
-        default=2.0, 
+        default=5.0, 
         metadata={"help": "Threshold multiplier M for LOD outlier detection"}
     )
     theta_type: Literal["act", "lod"] = field(
@@ -107,15 +103,15 @@ class AiraMoeConfig(PeftConfig):
         metadata={"help": "Type of importance metric for rank allocation: 'act' for activation, 'lod' for LOD"}
     )
     rank_budget: int = field(
-        default=64, 
+        default=16*32, 
         metadata={"help": "Total rank budget for optimization-based allocation"}
     )
     min_rank: int = field(
-        default=1, 
+        default=8, 
         metadata={"help": "Minimum rank for each layer"}
     )
     max_rank: int = field(
-        default=16, 
+        default=32, 
         metadata={"help": "Maximum rank for each layer"}
     )
     objective_function: Literal["log", "linear", "exp2", "cubic"] = field(
@@ -262,3 +258,4 @@ class AiraMoeConfig(PeftConfig):
         if self._custom_modules is None:
             self._custom_modules = {}
         self._custom_modules.update(mapping) 
+

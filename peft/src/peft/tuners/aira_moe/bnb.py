@@ -40,8 +40,7 @@ if is_bnb_available():
             r: int = 0,
             lora_alpha: int = 1,
             lora_dropout: float = 0.0,
-            num_A: int = 1,
-            num_B: int = 1,
+            # simplified: single A/B (num_A/num_B removed)
             init_lora_weights: Union[bool, str] = True,
             use_layer_wise_rank: bool = False,
             use_awsvd_init: bool = False,
@@ -61,8 +60,7 @@ if is_bnb_available():
                 r,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
-                num_A=num_A,
-                num_B=num_B,
+                # simplified AIRA: single A/B
                 init_lora_weights=init_lora_weights,
                 use_layer_wise_rank=use_layer_wise_rank,
                 use_awsvd_init=use_awsvd_init,
@@ -154,15 +152,9 @@ if is_bnb_available():
             """
             Compute the delta weight for the given adapter (AiraMoe version with multiple A and B matrices).
             """
-            # Sum all A matrices
-            weight_A = torch.sum(torch.stack([
-                layer.weight for layer in self.lora_A[adapter]
-            ]), dim=0)
-            
-            # Sum all B matrices
-            weight_B = torch.sum(torch.stack([
-                layer.weight for layer in self.lora_B[adapter]
-            ]), dim=0)
+            # Single A/B weights
+            weight_A = self.lora_A[adapter].weight
+            weight_B = self.lora_B[adapter].weight
             
             # Compute delta weight
             output_tensor = transpose(weight_B @ weight_A, False) * self.scaling[adapter]
@@ -215,19 +207,14 @@ if is_bnb_available():
                             weight_shape = [1] * (x.dim() - 1) + [activation_weights.size(-1)]
                             activation_weights_expanded = activation_weights.view(*weight_shape)
                             x_weighted = dropout(x) * activation_weights_expanded
-                            # CoLA collaborative strategy with activation weighting
-                            for i in range(self.num_A[active_adapter]):
-                                for j in range(self.num_B[active_adapter]):
-                                    lora_result = lora_B[j](lora_A[i](x_weighted)) * scaling
-                                    if requires_conversion:
-                                        lora_result = lora_result.to(expected_dtype)
-                                    result += lora_result
+                            # Single A/B path
+                            lora_result = lora_B(lora_A(x_weighted)) * scaling
+                            if requires_conversion:
+                                lora_result = lora_result.to(expected_dtype)
+                            result += lora_result
                         else:  # outps mode
                             # Apply weights to output
-                            lora_output = 0
-                            for i in range(self.num_A[active_adapter]):
-                                for j in range(self.num_B[active_adapter]):
-                                    lora_output += lora_B[j](lora_A[i](dropout(x)))
+                            lora_output = lora_B(lora_A(dropout(x)))
                             # activation_weights has shape [out_features], need to broadcast to match lora_output
                             weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
                             activation_weights_expanded = activation_weights.view(*weight_shape)
@@ -236,13 +223,11 @@ if is_bnb_available():
                                 lora_result = lora_result.to(expected_dtype)
                             result += lora_result
                     else:
-                        # Standard CoLA collaborative strategy without activation weighting
-                        for i in range(self.num_A[active_adapter]):
-                            for j in range(self.num_B[active_adapter]):
-                                lora_result = lora_B[j](lora_A[i](dropout(x))) * scaling
-                                if requires_conversion:
-                                    lora_result = lora_result.to(expected_dtype)
-                                result += lora_result
+                        # Single A/B path without activation weighting
+                        lora_result = lora_B(lora_A(dropout(x))) * scaling
+                        if requires_conversion:
+                            lora_result = lora_result.to(expected_dtype)
+                        result += lora_result
 
             return result
 
@@ -263,8 +248,7 @@ if is_bnb_4bit_available():
             r: int = 0,
             lora_alpha: int = 1,
             lora_dropout: float = 0.0,
-            num_A: int = 1,
-            num_B: int = 1,
+            # simplified: single A/B (num_A/num_B removed)
             init_lora_weights: Union[bool, str] = True,
             use_layer_wise_rank: bool = False,
             use_awsvd_init: bool = False,
@@ -284,8 +268,7 @@ if is_bnb_4bit_available():
                 r,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
-                num_A=num_A,
-                num_B=num_B,
+                # simplified AIRA: single A/B
                 init_lora_weights=init_lora_weights,
                 use_layer_wise_rank=use_layer_wise_rank,
                 use_awsvd_init=use_awsvd_init,
@@ -364,15 +347,9 @@ if is_bnb_4bit_available():
             """
             Compute the delta weight for the given adapter (AiraMoe version with multiple A and B matrices).
             """
-            # Sum all A matrices
-            weight_A = torch.sum(torch.stack([
-                layer.weight for layer in self.lora_A[adapter]
-            ]), dim=0)
-            
-            # Sum all B matrices
-            weight_B = torch.sum(torch.stack([
-                layer.weight for layer in self.lora_B[adapter]
-            ]), dim=0)
+            # Single A/B weights
+            weight_A = self.lora_A[adapter].weight
+            weight_B = self.lora_B[adapter].weight
             
             # Compute delta weight
             output_tensor = transpose(weight_B @ weight_A, False) * self.scaling[adapter]
@@ -427,19 +404,14 @@ if is_bnb_4bit_available():
                             weight_shape = [1] * (x.dim() - 1) + [activation_weights.size(-1)]
                             activation_weights_expanded = activation_weights.view(*weight_shape)
                             x_weighted = dropout(x) * activation_weights_expanded
-                            # CoLA collaborative strategy with activation weighting
-                            for i in range(self.num_A[active_adapter]):
-                                for j in range(self.num_B[active_adapter]):
-                                    lora_result = lora_B[j](lora_A[i](x_weighted)) * scaling
-                                    if requires_conversion:
-                                        lora_result = lora_result.to(expected_dtype)
-                                    result += lora_result
+                            # Single A/B path
+                            lora_result = lora_B(lora_A(x_weighted)) * scaling
+                            if requires_conversion:
+                                lora_result = lora_result.to(expected_dtype)
+                            result += lora_result
                         else:  # outps mode
                             # Apply weights to output
-                            lora_output = 0
-                            for i in range(self.num_A[active_adapter]):
-                                for j in range(self.num_B[active_adapter]):
-                                    lora_output += lora_B[j](lora_A[i](dropout(x)))
+                            lora_output = lora_B(lora_A(dropout(x)))
                             # activation_weights has shape [out_features], need to broadcast to match lora_output
                             weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
                             activation_weights_expanded = activation_weights.view(*weight_shape)
@@ -448,13 +420,11 @@ if is_bnb_4bit_available():
                                 lora_result = lora_result.to(expected_dtype)
                             result += lora_result
                     else:
-                        # Standard CoLA collaborative strategy without activation weighting
-                        for i in range(self.num_A[active_adapter]):
-                            for j in range(self.num_B[active_adapter]):
-                                lora_result = lora_B[j](lora_A[i](dropout(x))) * scaling
-                                if requires_conversion:
-                                    lora_result = lora_result.to(expected_dtype)
-                                result += lora_result
+                        # Single A/B path without activation weighting
+                        lora_result = lora_B(lora_A(dropout(x))) * scaling
+                        if requires_conversion:
+                            lora_result = lora_result.to(expected_dtype)
+                        result += lora_result
 
             return result
 

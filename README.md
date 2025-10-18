@@ -21,13 +21,14 @@ For reproducibility, we open-source our data and code; the open-source list is a
 
 ## 🚀Download & Installation
 
-Enter the `LLaMA-Factory` directory, download the [Llama-3.2-3B](https://huggingface.co/meta-llama/Llama-3.2-3B) and [Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B) model weights to the `models` directory, modify the `prefix` field in the `environment.yaml` file, and set it to the directory where your Miniconda3/Anaconda is installed, and then create the conda environment:
+你需要进入LLaMA-Factory目录，然后使用以下命令安装依赖：
 
-```python
-conda env create -f environment.yaml
-conda activate llama_factory
+```bash
+cd LLaMA-Factory
+pip install -e ".[torch,metrics,vllm,hqq,bitsandbytes,gptq]" --no-build-isolation
 ```
 
+Extra dependencies available: torch, torch-npu, metrics, deepspeed, liger-kernel, bitsandbytes, hqq, eetq, gptq, aqlm, vllm, sglang, galore, apollo, badam, adam-mini, qwen, minicpm_v, openmind, swanlab, dev.
 
 
 ## ✨Fine-tuning

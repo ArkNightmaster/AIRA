@@ -38,7 +38,7 @@ class AiraMoeLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout", "num_A", "num_B")
+    other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
@@ -49,9 +49,7 @@ class AiraMoeLayer(BaseTunerLayer):
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
         
-        # CoLA parameters
-        self.num_A = {}
-        self.num_B = {}
+        # CoLA parameters (simplified to single A/B per adapter)
         
         # AwLoRA Core Technology parameters
         self.use_layer_wise_rank = {}
@@ -120,8 +118,7 @@ class AiraMoeLayer(BaseTunerLayer):
         r: int,
         lora_alpha: int,
         lora_dropout: float,
-        num_A: int,
-        num_B: int,
+        # removed num_A/num_B in simplified AIRA
         init_lora_weights: Union[bool, str],
         use_layer_wise_rank: bool = False,
         use_awsvd_init: bool = False,
@@ -137,12 +134,8 @@ class AiraMoeLayer(BaseTunerLayer):
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
-        self.scaling[adapter_name] = lora_alpha / r
+        self.scaling[adapter_name] = 2
         self.lora_dropout[adapter_name] = nn.Dropout(p=lora_dropout)
-        
-        # CoLA parameters
-        self.num_A[adapter_name] = num_A
-        self.num_B[adapter_name] = num_B
         
         # AwLoRA parameters
         self.use_layer_wise_rank[adapter_name] = use_layer_wise_rank
@@ -153,13 +146,9 @@ class AiraMoeLayer(BaseTunerLayer):
         self.awsvd_collect_steps[adapter_name] = awsvd_collect_steps
         self.activation_stats_collected[adapter_name] = False
 
-        # Create multiple A and B matrices (CoLA style)
-        self.lora_A[adapter_name] = nn.ModuleList([
-            nn.Linear(self.in_features, r, bias=False) for _ in range(num_A)
-        ])
-        self.lora_B[adapter_name] = nn.ModuleList([
-            nn.Linear(r, self.out_features, bias=False) for _ in range(num_B)
-        ])
+        # Create single A and B matrices
+        self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
+        self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
 
         # Initialize weights
         if init_lora_weights == "awsvd":
@@ -172,41 +161,32 @@ class AiraMoeLayer(BaseTunerLayer):
         # Move to device and convert to correct dtype
         self._move_adapter_to_device_of_base_layer(adapter_name)
         
-        # Additional manual dtype conversion for ModuleList items
+        # Additional manual dtype conversion for adapter modules
         weight = getattr(self.get_base_layer(), "weight", None)
         if weight is not None and (weight.dtype.is_floating_point or weight.dtype.is_complex):
-            # Convert each module in the ModuleList to the correct dtype
-            for i in range(num_A):
-                self.lora_A[adapter_name][i] = self.lora_A[adapter_name][i].to(weight.dtype)
-            for i in range(num_B):
-                self.lora_B[adapter_name][i] = self.lora_B[adapter_name][i].to(weight.dtype)
+            self.lora_A[adapter_name] = self.lora_A[adapter_name].to(weight.dtype)
+            self.lora_B[adapter_name] = self.lora_B[adapter_name].to(weight.dtype)
 
         self.set_adapter(self.active_adapters)
 
     def _init_lora_weights_standard(self, adapter_name: str) -> None:
         """Standard LoRA weight initialization."""
-        for i in range(self.num_A[adapter_name]):
-            nn.init.kaiming_uniform_(self.lora_A[adapter_name][i].weight, a=math.sqrt(5))
-        for i in range(self.num_B[adapter_name]):
-            nn.init.zeros_(self.lora_B[adapter_name][i].weight)
+        nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B[adapter_name].weight)
 
     def _init_lora_weights(self, adapter_name: str, init_lora_weights: Union[bool, str]) -> None:
         """Initialize LoRA weights based on the specified method."""
         if init_lora_weights is False:
             # Random initialization
-            for i in range(self.num_A[adapter_name]):
-                nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
-            for i in range(self.num_B[adapter_name]):
-                nn.init.normal_(self.lora_B[adapter_name][i].weight, std=1 / self.r[adapter_name])
+            nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+            nn.init.normal_(self.lora_B[adapter_name].weight, std=1 / self.r[adapter_name])
         elif init_lora_weights is True:
             # Default initialization
             self._init_lora_weights_standard(adapter_name)
         elif init_lora_weights.lower() == "gaussian":
             # Gaussian initialization
-            for i in range(self.num_A[adapter_name]):
-                nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
-            for i in range(self.num_B[adapter_name]):
-                nn.init.zeros_(self.lora_B[adapter_name][i].weight)
+            nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+            nn.init.zeros_(self.lora_B[adapter_name].weight)
         elif init_lora_weights.lower() == "pissa":
             # PiSSA initialization (similar to CoLA)
             self._pissa_init(adapter_name)
@@ -225,24 +205,20 @@ class AiraMoeLayer(BaseTunerLayer):
         Uhr = Uh[:self.r[adapter_name]]
         
         # Distribute among multiple A and B matrices
-        lora_A = (torch.diag(torch.sqrt(Sr)) @ Uhr) / self.num_A[adapter_name]
-        lora_B = (Vr @ torch.diag(torch.sqrt(Sr))) / self.num_B[adapter_name]
+        lora_A = (torch.diag(torch.sqrt(Sr)) @ Uhr)
+        lora_B = (Vr @ torch.diag(torch.sqrt(Sr)))
         
         # Convert back to original dtype for LoRA parameters
-        original_dtype = self.lora_A[adapter_name][0].weight.dtype
+        original_dtype = self.lora_A[adapter_name].weight.dtype
         lora_A = lora_A.to(original_dtype)
         lora_B = lora_B.to(original_dtype)
         
         # Initialize all matrices
-        for i in range(self.num_A[adapter_name]):
-            self.lora_A[adapter_name][i].weight.data = lora_A.clone()
-        for i in range(self.num_B[adapter_name]):
-            self.lora_B[adapter_name][i].weight.data = lora_B.clone()
+        self.lora_A[adapter_name].weight.data = lora_A.clone()
+        self.lora_B[adapter_name].weight.data = lora_B.clone()
         
         # Update base weight (convert back to original dtype)
-        delta_weight = self.scaling[adapter_name] * (
-            (lora_B.to(torch.float32) * self.num_B[adapter_name]) @ (lora_A.to(torch.float32) * self.num_A[adapter_name])
-        )
+        delta_weight = self.scaling[adapter_name] * (lora_B.to(torch.float32) @ lora_A.to(torch.float32))
         weight.data -= delta_weight
 
     def _awsvd_init(self, adapter_name: str, inputs: torch.Tensor) -> None:
@@ -278,19 +254,17 @@ class AiraMoeLayer(BaseTunerLayer):
         S_inv = torch.diag(1.0 / (S_diag + 1e-8))  # Add epsilon for numerical stability
         
         # Distribute among multiple A and B matrices
-        lora_A = (Vh @ S_inv) / self.num_A[adapter_name]
-        lora_B = (U @ torch.diag(S_vals)) / self.num_B[adapter_name]
+        lora_A = (Vh @ S_inv)
+        lora_B = (U @ torch.diag(S_vals))
         
         # Convert back to original dtype for LoRA parameters
-        original_dtype = self.lora_A[adapter_name][0].weight.dtype
+        original_dtype = self.lora_A[adapter_name].weight.dtype
         lora_A = lora_A.to(original_dtype)
         lora_B = lora_B.to(original_dtype)
         
         # Initialize all matrices
-        for i in range(self.num_A[adapter_name]):
-            self.lora_A[adapter_name][i].weight.data = lora_A.clone()
-        for i in range(self.num_B[adapter_name]):
-            self.lora_B[adapter_name][i].weight.data = lora_B.clone()
+        self.lora_A[adapter_name].weight.data = lora_A.clone()
+        self.lora_B[adapter_name].weight.data = lora_B.clone()
             
         self.activation_stats_collected[adapter_name] = True
 
@@ -340,17 +314,13 @@ class AiraMoeLayer(BaseTunerLayer):
     def reset_lora_parameters(self, adapter_name: str, init_lora_weights: Union[bool, str]) -> None:
         """Reset LoRA parameters."""
         if init_lora_weights is False:
-            for i in range(self.num_A[adapter_name]):
-                nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
-            for i in range(self.num_B[adapter_name]):
-                nn.init.normal_(self.lora_B[adapter_name][i].weight, std=1 / self.r[adapter_name])
+            nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+            nn.init.normal_(self.lora_B[adapter_name].weight, std=1 / self.r[adapter_name])
         elif init_lora_weights is True:
             self._init_lora_weights_standard(adapter_name)
         elif init_lora_weights.lower() == "gaussian":
-            for i in range(self.num_A[adapter_name]):
-                nn.init.normal_(self.lora_A[adapter_name][i].weight, std=1 / self.r[adapter_name])
-            for i in range(self.num_B[adapter_name]):
-                nn.init.zeros_(self.lora_B[adapter_name][i].weight)
+            nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
+            nn.init.zeros_(self.lora_B[adapter_name].weight)
         elif init_lora_weights.lower() == "pissa":
             self._pissa_init(adapter_name)
 
@@ -490,16 +460,24 @@ class Linear(nn.Module, AiraMoeLayer):
         """
         Compute the delta weight for the given adapter.
         """
-        # Sum all A matrices
-        weight_A = torch.sum(torch.stack([
-            layer.weight for layer in self.lora_A[adapter]
-        ]), dim=0)
-        
-        # Sum all B matrices
-        weight_B = torch.sum(torch.stack([
-            layer.weight for layer in self.lora_B[adapter]
-        ]), dim=0)
-        
+        # Support both single Linear (nn.Linear) and multi-matrix (ModuleList) implementations
+        lora_A = self.lora_A[adapter]
+        lora_B = self.lora_B[adapter]
+
+        if isinstance(lora_A, nn.ModuleList):
+            # Sum all A matrices
+            weight_A = torch.sum(torch.stack([layer.weight for layer in lora_A]), dim=0)
+        else:
+            # Single A matrix
+            weight_A = lora_A.weight
+
+        if isinstance(lora_B, nn.ModuleList):
+            # Sum all B matrices
+            weight_B = torch.sum(torch.stack([layer.weight for layer in lora_B]), dim=0)
+        else:
+            # Single B matrix
+            weight_B = lora_B.weight
+
         # Compute delta weight
         output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
         return output_tensor
@@ -523,7 +501,18 @@ class Linear(nn.Module, AiraMoeLayer):
             result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
             
-            for active_adapter in self.active_adapters:
+            # Deduplicate active adapters to avoid reusing the same parameters twice per forward
+            if isinstance(self.active_adapters, (list, tuple)):
+                _unique_active_adapters = []
+                _seen = set()
+                for _a in self.active_adapters:
+                    if _a not in _seen:
+                        _unique_active_adapters.append(_a)
+                        _seen.add(_a)
+            else:
+                _unique_active_adapters = [self.active_adapters]
+
+            for active_adapter in _unique_active_adapters:
                 if active_adapter not in self.lora_A.keys():
                     continue
                     
@@ -532,46 +521,36 @@ class Linear(nn.Module, AiraMoeLayer):
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 
-                # AwLoRA Core Technology 2: AwSVD initialization
-                if (self.use_awsvd_init[active_adapter] and 
-                    not self.activation_stats_collected[active_adapter] and 
-                    self.training):
-                    self._awsvd_init(active_adapter, x)
+                # AwLoRA Core Technology 2: AwSVD initialization is handled before training
+                # Initialization is now controlled by trainer._initialize_aira_moe_with_activations()
                 
                 # AwLoRA Core Technology 3: Activation-aware weighting
                 if self.use_activation_aware[active_adapter]:
                     activation_weights = self._compute_activation_weights(
-                        x, 
+                        x,
                         self.activation_aware_mode[active_adapter],
                         self.activation_normalize[active_adapter]
                     )
-                    
+
                     if self.activation_aware_mode[active_adapter] == "inps":
-                        # Apply weights to input
-                        # activation_weights has shape [hidden_size], need to broadcast to match x
-                        # For x with shape [batch_size, seq_len, hidden_size], we need [1, 1, hidden_size]
+                        # Apply weights to input: compute sum over A first, then apply each B once
                         weight_shape = [1] * (x.dim() - 1) + [activation_weights.size(-1)]
                         activation_weights_expanded = activation_weights.view(*weight_shape)
                         x_weighted = dropout(x) * activation_weights_expanded
-                        # CoLA collaborative strategy with activation weighting
-                        for i in range(self.num_A[active_adapter]):
-                            for j in range(self.num_B[active_adapter]):
-                                result += lora_B[j](lora_A[i](x_weighted)) * scaling
+
+                        out_A = lora_A(x_weighted)
+                        result = result + (lora_B(out_A) * scaling)
                     else:  # outps mode
-                        # Apply weights to output
-                        lora_output = 0
-                        for i in range(self.num_A[active_adapter]):
-                            for j in range(self.num_B[active_adapter]):
-                                lora_output += lora_B[j](lora_A[i](dropout(x)))
-                        # activation_weights has shape [out_features], need to broadcast to match lora_output
+                        # Compute sum over A first using dropout(x), then apply each B once; weight outputs afterward
+                        x_drop = dropout(x)
+                        lora_output = lora_B(lora_A(x_drop))
                         weight_shape = [1] * (lora_output.dim() - 1) + [activation_weights.size(-1)]
                         activation_weights_expanded = activation_weights.view(*weight_shape)
-                        result += (lora_output * activation_weights_expanded) * scaling
+                        result = result + ((lora_output * activation_weights_expanded) * scaling)
                 else:
-                    # Standard CoLA collaborative strategy without activation weighting
-                    for i in range(self.num_A[active_adapter]):
-                        for j in range(self.num_B[active_adapter]):
-                            result += lora_B[j](lora_A[i](dropout(x))) * scaling
+                    # Standard CoLA: compute sum over A first, then apply each B once
+                    x_drop = dropout(x)
+                    result = result + (lora_B(lora_A(x_drop)) * scaling)
 
             result = result.to(torch_result_dtype)
 
@@ -631,7 +610,7 @@ class Embedding(nn.Embedding, AiraMoeLayer):
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
-        self.scaling[adapter_name] = lora_alpha / r
+        self.scaling[adapter_name] = 2
         self.lora_dropout[adapter_name] = nn.Dropout(p=lora_dropout)
         
         # CoLA parameters
@@ -758,7 +737,7 @@ class Conv2d(nn.Conv2d, AiraMoeLayer):
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
-        self.scaling[adapter_name] = lora_alpha / r
+        self.scaling[adapter_name] = 2
         self.lora_dropout[adapter_name] = nn.Dropout(p=lora_dropout)
         
         # CoLA parameters
@@ -792,10 +771,8 @@ class Conv2d(nn.Conv2d, AiraMoeLayer):
         weight = getattr(self.get_base_layer(), "weight", None)
         if weight is not None and (weight.dtype.is_floating_point or weight.dtype.is_complex):
             # Convert each module in the ModuleList to the correct dtype
-            for i in range(num_A):
-                self.lora_A[adapter_name][i] = self.lora_A[adapter_name][i].to(weight.dtype)
-            for i in range(num_B):
-                self.lora_B[adapter_name][i] = self.lora_B[adapter_name][i].to(weight.dtype)
+            self.lora_A[adapter_name] = self.lora_A[adapter_name].to(weight.dtype)
+            self.lora_B[adapter_name] = self.lora_B[adapter_name].to(weight.dtype)
 
         self.set_adapter(self.active_adapters)
 

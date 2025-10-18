@@ -353,8 +353,7 @@ def _setup_cola_tuning(
             "target_modules": target_modules,
             "lora_alpha": finetuning_args.lora_alpha,
             "lora_dropout": finetuning_args.lora_dropout,
-            "num_A": finetuning_args.num_A,
-            "num_B": finetuning_args.num_B,
+            # AIRA simplified: single A/B per layer (num_A/num_B removed)
             # "cola_type": finetuning_args.cola_type,
             # "expert_num": finetuning_args.expert_num,
             "modules_to_save": finetuning_args.additional_target,
@@ -745,6 +744,7 @@ def _setup_aira_moe_tuning(
 
     if model_args.adapter_name_or_path is not None:
         is_mergeable = True
+        logger.info_rank0(f"Adapter name or path: {model_args.adapter_name_or_path}")
         if getattr(model, "quantization_method", None):  # merge lora in quantized model is unstable
             assert len(model_args.adapter_name_or_path) == 1, "Quantized model only accepts a single adapter."
             is_mergeable = False
@@ -772,6 +772,7 @@ def _setup_aira_moe_tuning(
         }
 
         for adapter in adapter_to_merge:
+            logger.info_rank0(f"Loading adapter {adapter} for merging.")
             model: "AiraMoeModel" = PeftModel.from_pretrained(model, adapter, **init_kwargs)
             # model = model.merge_and_unload()
 
@@ -779,6 +780,7 @@ def _setup_aira_moe_tuning(
             logger.info_rank0(f"Merged {len(adapter_to_merge)} adapter(s).")
 
         if adapter_to_resume is not None:  # resume aira_moe training
+            logger.info_rank0(f"Loading adapter {adapter_to_resume} for training.")
             if model_args.use_unsloth:
                 model = load_unsloth_peft_model(config, model_args, is_trainable=is_trainable)
             else:
@@ -820,8 +822,7 @@ def _setup_aira_moe_tuning(
             "target_modules": target_modules,
             "lora_alpha": finetuning_args.lora_alpha,
             "lora_dropout": finetuning_args.lora_dropout,
-            "num_A": finetuning_args.num_A,
-            "num_B": finetuning_args.num_B,
+            # AIRA simplified: single A/B per layer (num_A/num_B removed)
             # AwLoRA Core Technology 1: Layer-wise Rank Allocation
             "use_layer_wise_rank": finetuning_args.use_layer_wise_rank,
             "lod_threshold_M": finetuning_args.lod_threshold_M,

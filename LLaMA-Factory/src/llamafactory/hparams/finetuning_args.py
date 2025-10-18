@@ -385,8 +385,6 @@ class FinetuningArguments(
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
     lora_num: int = field(default=1, metadata={"help": "Lora number"})
-    num_A: int = field(default=1, metadata={"help": "Matrix A number"})
-    num_B: int = field(default=1, metadata={"help": "Matrix B number"})
 
     # AIRA_MoE specific parameters
     # AwLoRA Core Technology 1: Layer-wise Rank Allocation
@@ -441,6 +439,12 @@ class FinetuningArguments(
     activation_normalize: bool = field(
         default=True,
         metadata={"help": "Whether to normalize activation weights to [0,1] (AIRA_MoE)"}
+    )
+
+    # Merge-and-save control
+    merge_and_save: bool = field(
+        default=False,
+        metadata={"help": "If True, merge adapters into base model before saving final checkpoint."}
     )
 
     def __post_init__(self):

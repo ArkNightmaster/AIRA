@@ -1,11 +1,11 @@
 #!/bin/bash
-# AIRA_MoE - Law Domain
-# Full version with all AwLoRA technologies enabled
+# LoRA - Law Domain
+# Standard LoRA fine-tuning
 # Optimized for legal reasoning and analysis
 export DISABLE_VERSION_CHECK=true
 export CUDA_VISIBLE_DEVICES=0,1
-
 module add cuda/12.4
+
 
 cd LLaMA-Factory
 
@@ -16,8 +16,12 @@ llamafactory-cli train \
     --dataset us_terms,Lawyer-Instruct \
     --dataset_dir ./data \
     --template llama3 \
-    --finetuning_type aira_moe \
-    --output_dir ./saves/Llama-3.1-8B-Instruct/AIRA_MoE_Law \
+    --finetuning_type lora \
+    --lora_target all \
+    --lora_r 8 \
+    --lora_alpha 16 \
+    --lora_dropout 0.05 \
+    --output_dir ./saves/Llama-3.1-8B-Instruct/LoRA_Law \
     --overwrite_cache \
     --overwrite_output_dir \
     --cutoff_len 1024 \
@@ -32,30 +36,14 @@ llamafactory-cli train \
     --eval_steps 50 \
     --evaluation_strategy steps \
     --load_best_model_at_end \
-    --learning_rate 5e-3 \
-    --num_train_epochs 3.0 \
+    --learning_rate 5e-5 \
+    --num_train_epochs 5.0 \
     --val_size 0.1 \
     --plot_loss \
     --bf16 \
-    --max_samples 1000 \
-    --rank_budget 512 \
-    --theta_type lod \
-    --objective_function log \
-    --min_rank 8 \
-    --max_rank 32 \
-    --lora_alpha 32 \
-    --lora_dropout 0.05 \
-    --lod_threshold_M 4.0 \
-    --awsvd_collect_steps 100 \
-    --ddp_find_unused_parameters true \
-    --use_reentrant_gc false \
-    --use_layer_wise_rank true \
-    # --use_awsvd_init true \
-    # --use_activation_aware false \
-    # --activation_aware_mode inps \
-    # --activation_normalize true 
+    --max_samples 1000
 
-# Evaluation command (uncomment to run)
+# Evaluation command
 llamafactory-cli eval \
     --model_name_or_path /aifs4su/gov/models/Llama-3.1-8B-Instruct \
     --template llama3 \
@@ -64,6 +52,4 @@ llamafactory-cli eval \
     --n_shot 0 \
     --batch_size 8 \
     --trust_remote_code \
-    --adapter_name_or_path ./saves/Llama-3.1-8B-Instruct/AIRA_MoE_Law \
-    # --save_dir ./saves/Llama-3.1-8B-Instruct/AIRA_MoE_Law/test_results
-#     --ddp_find_unused_parameters false 
+    --adapter_name_or_path ./saves/Llama-3.1-8B-Instruct/LoRA_Law

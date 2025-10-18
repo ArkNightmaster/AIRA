@@ -35,7 +35,9 @@ _HOMEPAGE = "https://github.com/hendrycks/test"
 
 _LICENSE = "MIT"
 
-_URL = "mmlu.zip"
+# Point to the local dataset directory so `download_and_extract` returns it as-is
+# This avoids relying on the cached module path for locating a sibling zip file.
+_URL = "/aifs4su/hansirui_2nd/lidezhi/AIRA/LLaMA-Factory/evaluation/mmlu"
 
 task_list = [
     "high_school_european_history",
@@ -131,7 +133,8 @@ class MMLU(datasets.GeneratorBasedBuilder):
         )
 
     def _split_generators(self, dl_manager):
-        data_dir = dl_manager.download_and_extract(_URL)
+        # Support both local directory and local/remote archive URLs
+        data_dir = _URL if os.path.isdir(_URL) else dl_manager.download_and_extract(_URL)
         task_name = self.config.name
         return [
             datasets.SplitGenerator(
